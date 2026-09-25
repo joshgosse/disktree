@@ -922,7 +922,7 @@ fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
             ));
         }
     } else {
-        for category in Category::LEGEND {
+        for &category in Category::LEGEND {
             lane = lane.child(item(
                 widgets::swatch(palette::category_accent(theme, category)),
                 category.label(),

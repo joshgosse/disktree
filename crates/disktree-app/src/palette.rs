@@ -28,6 +28,7 @@ const fn hue(category: Category) -> (f32, f32) {
         Category::Synced => (0.535, 1.0),
         Category::Git => (0.955, 1.0),
         Category::Media => (0.745, 1.0),
+        Category::Apps => (0.845, 0.85),
         Category::Cache => (0.125, 0.95),
         Category::Documents => (0.6, 0.18),
         Category::Other => (0.6, 0.08),
@@ -225,7 +226,7 @@ mod tests {
     fn the_highlight_is_not_a_category_colour() {
         let theme = theme(ThemeAppearance::Dark);
         let highlight = highlight(&theme);
-        for category in Category::LEGEND {
+        for &category in Category::LEGEND {
             let fill = category_fill(&theme, category, 0);
             assert!(highlight.s - fill.s > 0.2, "{category:?} competes");
         }
