@@ -4,7 +4,7 @@
 //! decisions — what is selected, what a mark means, what a key does, when to
 //! re-scan — live here so they can be reasoned about in one place.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use disktree_core::camera::LevelTransition;
+use disktree_core::checkout::{Checkout, Reading, read_checkout};
+use disktree_core::details::{CheckoutItem, Detail, details};
 use disktree_core::filter::{Keep, Matches, filter};
 use disktree_core::insights::{Candidate, worth_a_look};
 use disktree_core::partition::{Partition, partition};
@@ -38,8 +40,8 @@ use gpui_omarchy::Status;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::charts::{Chart, ChartGeometry, Location, clipped};
-use crate::git::GitState;
 use crate::marks::{Marks, display_path, is_hidden};
+use crate::readings::Readings;
 use crate::settings::Settings;
 use crate::themes::ThemeChoice;
 use crate::treemap_view::{CenterLabel, Mosaic, TileDeco};
@@ -512,10 +514,18 @@ pub struct Disktree {
     pub insights: Vec<Candidate>,
     /// Bumped per scan; only the newest findings are kept.
     insights_epoch: u64,
-    /// What git knows about each checkout that has been selected; `None`
-    /// once asked and found not to be one.
-    pub git: FxHashMap<PathBuf, Option<GitState>>,
-    git_pending: FxHashSet<PathBuf>,
+    /// What git says about each checkout the panel or the review has
+    /// shown, by the path that is marked.
+    pub checkouts: Readings<PathBuf, CheckoutInput, Checkout>,
+    /// What each directory is beyond its size, by path. The panel asks on
+    /// every pointer move; an answer holds until the next tree.
+    details_cache: RefCell<FxHashMap<PathBuf, Vec<Detail>>>,
+    /// Since when each reading has been wanted, frame after frame: a reading
+    /// starts only once it has been for [`READING_SETTLE`], so sweeping the
+    /// pointer across a folder of checkouts starts none of them.
+    wanted_since: FxHashMap<PathBuf, Instant>,
+    /// A frame is due when the youngest wanted reading settles.
+    settle_pending: bool,
     /// The device the scanned volume is mounted from.
     pub device: Option<String>,
     /// The name the Finder shows for it, on macOS.
@@ -634,8 +644,10 @@ impl Disktree {
             color_mode: ColorMode::Kind,
             insights: Vec::new(),
             insights_epoch: 0,
-            git: FxHashMap::default(),
-            git_pending: FxHashSet::default(),
+            checkouts: Readings::new(READINGS_AT_ONCE),
+            details_cache: RefCell::default(),
+            wanted_since: FxHashMap::default(),
+            settle_pending: false,
             device: None,
             volume_name: None,
             full_disk_access: None,
@@ -771,9 +783,10 @@ impl Disktree {
             return;
         };
         let (epoch, now) = (self.insights_epoch, self.scanned_at);
-        let task = cx
-            .background_executor()
-            .spawn(async move { worth_a_look(&tree, now, INSIGHT_LIMIT) });
+        let task = cx.background_executor().spawn({
+            let root = self.root_path.clone();
+            async move { worth_a_look(&tree, &root, now, INSIGHT_LIMIT) }
+        });
         cx.spawn(async move |this, cx| {
             let found = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -792,26 +805,235 @@ impl Disktree {
         self.plan = plan(self.marks.items(), &self.root_path);
     }
 
-    /// Ask git about `path` once, off the UI thread, if it is a checkout.
-    pub fn ensure_git(&mut self, path: &Path, cx: &Context<'_, Self>) {
-        if self.git.contains_key(path) || self.git_pending.contains(path) {
+    /// What the directory at `crumbs` is beyond its size.
+    pub fn details_at(&self, crumbs: &[usize]) -> Vec<Detail> {
+        let (Some(node), Some(path)) =
+            (self.node_at(crumbs), self.path_at(crumbs))
+        else {
+            return Vec::new();
+        };
+        if !node.is_dir() {
+            return Vec::new();
+        }
+        self.details_cache
+            .borrow_mut()
+            .entry(path)
+            .or_insert_with_key(|path| details(node, path))
+            .clone()
+    }
+
+    /// The readings the screen on show would draw, the pointed-at ones
+    /// first; the rest of the queue is dropped.
+    fn wanted_readings(&self, panel: bool) -> Vec<(CheckoutItem, bool)> {
+        let mut wanted = Vec::new();
+        match self.screen {
+            Screen::Explore if panel => {
+                for detail in self.panel_details() {
+                    match detail {
+                        Detail::Checkout(item) => wanted.push((item, true)),
+                        Detail::Worktrees { items, .. } => {
+                            wanted.extend(
+                                items.into_iter().map(|item| (item, false)),
+                            );
+                        }
+                    }
+                }
+            }
+            Screen::Review => {
+                for target in self.marks.items() {
+                    if let Some(item) = self.marked_checkout(&target.path) {
+                        wanted.push((item, false));
+                    }
+                }
+            }
+            _ => {}
+        }
+        wanted
+    }
+
+    /// What the panel says about the item keys act on, beyond its size. A
+    /// folder of worktrees keeps its list while its own items are pointed
+    /// at, so the list and its button stay put on the way to them.
+    pub fn panel_details(&self) -> Vec<Detail> {
+        let target =
+            self.action_target().unwrap_or_else(|| self.crumbs.clone());
+        let mut shown = self.details_at(&target);
+        let is_list =
+            |detail: &Detail| matches!(detail, Detail::Worktrees { .. });
+        if target != self.crumbs && !shown.iter().any(is_list) {
+            shown.extend(
+                self.details_at(&self.crumbs).into_iter().filter(is_list),
+            );
+        }
+        shown
+    }
+
+    pub fn marked_checkout(&self, path: &Path) -> Option<CheckoutItem> {
+        let crumbs = self.crumbs_for_path(path)?;
+        match self.details_at(&crumbs).into_iter().next() {
+            Some(Detail::Checkout(item)) => Some(item),
+            _ => None,
+        }
+    }
+
+    /// Start what this frame shows, once each has been wanted long enough.
+    pub fn want_readings(&mut self, panel: bool, cx: &Context<'_, Self>) {
+        let wanted = self.wanted_readings(panel);
+        let now = Instant::now();
+        let mut since = FxHashMap::default();
+        for (item, _) in &wanted {
+            let first =
+                self.wanted_since.get(&item.item).copied().unwrap_or(now);
+            since.insert(item.item.clone(), first);
+        }
+        self.wanted_since = since;
+        let settling = wanted
+            .iter()
+            .filter_map(|(item, _)| {
+                let waited = now.duration_since(self.wanted_since[&item.item]);
+                READING_SETTLE.checked_sub(waited)
+            })
+            .min();
+        let settled: Vec<(CheckoutItem, bool)> = wanted
+            .into_iter()
+            .filter(|(item, _)| {
+                now.duration_since(self.wanted_since[&item.item])
+                    >= READING_SETTLE
+            })
+            .collect();
+        self.request_readings(settled, cx);
+        if let Some(wait) = settling
+            && !std::mem::replace(&mut self.settle_pending, true)
+        {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.settle_pending = false;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Queue `wanted` and nothing else, then start what there is room for.
+    pub fn request_readings(
+        &mut self,
+        wanted: Vec<(CheckoutItem, bool)>,
+        cx: &Context<'_, Self>,
+    ) {
+        let keys: FxHashSet<PathBuf> =
+            wanted.iter().map(|(item, _)| item.item.clone()).collect();
+        self.checkouts.retain(|key| keys.contains(key));
+        let tree = self.tree.clone();
+        // The pointed-at ones go to the front in the order they are shown.
+        for (item, urgent) in wanted.into_iter().rev() {
+            let crumbs = self.crumbs_for_path(&item.item);
+            let input = CheckoutInput {
+                subtree: tree.clone().zip(crumbs),
+                item,
+            };
+            self.checkouts
+                .request(input.item.item.clone(), input, urgent);
+        }
+        self.start_readings(cx);
+    }
+
+    fn start_readings(&mut self, cx: &Context<'_, Self>) {
+        while let Some((key, input, generation)) = self.checkouts.next() {
+            let task = cx.background_executor().spawn(async move {
+                let subtree = input
+                    .subtree
+                    .as_ref()
+                    .and_then(|(tree, crumbs)| tree.resolve(crumbs));
+                read_checkout(&input.item, subtree)
+            });
+            cx.spawn(async move |this, cx| {
+                let reading = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.checkouts.finish(key, reading, generation);
+                    this.start_readings(cx);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Read `item` again now: what it said may be minutes old.
+    pub fn reread(&mut self, item: &CheckoutItem, cx: &mut Context<'_, Self>) {
+        self.checkouts.forget_key(&item.item);
+        self.wanted_since.remove(&item.item);
+        cx.notify();
+    }
+
+    /// Worktrees whose work is on the base and whose folder holds nothing
+    /// git lacks, once they have been read.
+    pub fn merged_and_clean<'a>(
+        &self,
+        items: &'a [CheckoutItem],
+    ) -> Vec<&'a CheckoutItem> {
+        items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    self.checkouts.get(&item.item),
+                    Some(Reading::Done(checkout))
+                        if checkout.loses_nothing() && checkout.is_landed()
+                )
+            })
+            .collect()
+    }
+
+    /// Mark worktrees by path, each absorbing any marks inside it, and say
+    /// what that came to. They still go through the review.
+    pub fn mark_worktrees(
+        &mut self,
+        paths: &[PathBuf],
+        cx: &mut Context<'_, Self>,
+    ) {
+        let (mut count, mut bytes) = (0_usize, 0_u64);
+        for path in paths {
+            if self.marks.contains(path) || self.marked_ancestor(path).is_some()
+            {
+                continue;
+            }
+            let Some(target) = self
+                .crumbs_for_path(path)
+                .and_then(|crumbs| self.target_at(&crumbs))
+            else {
+                continue;
+            };
+            bytes += target.bytes;
+            self.marks.toggle(target);
+            let inside: Vec<PathBuf> = self
+                .marks
+                .items()
+                .iter()
+                .filter(|item| {
+                    item.path != *path && item.path.starts_with(path)
+                })
+                .map(|item| item.path.clone())
+                .collect();
+            for inner in &inside {
+                self.marks.remove(inner);
+            }
+            count += 1;
+        }
+        if count == 0 {
             return;
         }
-        let path = path.to_path_buf();
-        self.git_pending.insert(path.clone());
-        let task = cx.background_executor().spawn({
-            let path = path.clone();
-            async move { crate::git::state(&path) }
-        });
-        cx.spawn(async move |this, cx| {
-            let state = task.await;
-            let _ = this.update(cx, |this, cx| {
-                this.git_pending.remove(&path);
-                this.git.insert(path, state);
-                cx.notify();
-            });
-        })
-        .detach();
+        self.space_baseline = self.space_baseline.or(self.space);
+        self.replan();
+        self.notice = Some((
+            format!(
+                "Marked {count} merged, clean worktree{} \u{00b7} {}",
+                if count == 1 { "" } else { "s" },
+                disktree_core::size::human_bytes(bytes)
+            ),
+            Status::Neutral,
+        ));
+        cx.notify();
     }
 
     /// Select the largest entry of the current root, so the selection line, the
@@ -853,7 +1075,8 @@ impl Disktree {
         self.context_menu = None;
         self.insights.clear();
         self.insights_epoch += 1;
-        self.git.clear();
+        self.checkouts.forget();
+        self.details_cache.borrow_mut().clear();
         self.clear_filter();
         self.begin_scan_clock();
         self.scan_root.clone_from(&self.root_path);
@@ -929,6 +1152,7 @@ impl Disktree {
                 }
                 self.marks.refresh(&self.root_path, &node, Metric::Bytes);
                 self.tree = Some(Arc::new(node));
+                self.details_cache.borrow_mut().clear();
                 self.cache = None;
                 self.replan();
                 self.refresh_insights(cx);
@@ -3270,6 +3494,12 @@ impl Disktree {
             ));
         } else {
             self.replan();
+            // A reading taken while pointing may be minutes old by now.
+            for target in self.marks.items().to_vec() {
+                if let Some(item) = self.marked_checkout(&target.path) {
+                    self.checkouts.forget_key(&item.item);
+                }
+            }
             self.screen = Screen::Review;
         }
         cx.notify();
@@ -3845,6 +4075,20 @@ const FOLDER_COLUMN_REMS: f32 = 7.5;
 /// Where [`crate::ui::ZOOM_STEPS`] is at 100%.
 const DEFAULT_ZOOM: usize = 2;
 
+/// A checkout to read, with the scanned subtree beneath it: where it is in
+/// the tree, so the tree need not be copied to the reader.
+pub struct CheckoutInput {
+    item: CheckoutItem,
+    subtree: Option<(Arc<Node>, Vec<usize>)>,
+}
+
+/// Readings at once: each is a handful of git processes, and one can use
+/// several cores for seconds.
+const READINGS_AT_ONCE: usize = 2;
+
+/// How long a reading must be wanted before it starts.
+const READING_SETTLE: Duration = Duration::from_millis(120);
+
 /// What revealing a path is called where it opens.
 const REVEAL: &str = if cfg!(target_os = "macos") {
     "Reveal in Finder"
@@ -3911,6 +4155,10 @@ impl Render for Disktree {
     ) -> impl gpui_kit::IntoElement {
         self.rem = window.rem_size().as_f32();
         self.tick_level_change(window);
+        let panel = self.show_selection
+            && window.viewport_size().width.as_f32() / self.rem
+                >= crate::views::PANEL_SHOWN_REMS;
+        self.want_readings(panel, cx);
         let menus = crate::app_menu::MenuState {
             mode: self.mode_index(),
             chart: self.chart,

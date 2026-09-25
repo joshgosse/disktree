@@ -7,9 +7,12 @@
 
 pub mod access;
 pub mod camera;
+pub mod checkout;
 pub mod classify;
+pub mod details;
 pub mod export;
 pub mod filter;
+pub mod git;
 pub mod insights;
 #[cfg(target_os = "macos")]
 mod macos;

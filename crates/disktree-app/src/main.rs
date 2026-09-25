@@ -14,9 +14,10 @@
 mod app_menu;
 mod appearance;
 mod charts;
-mod git;
+mod detail_cards;
 mod marks;
 mod palette;
+mod readings;
 mod settings;
 mod state;
 #[cfg(test)]

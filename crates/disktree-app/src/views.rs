@@ -424,9 +424,6 @@ fn explore(
     // The panel is where the selection, the marks and the disk live; it
     // only gives way when the mosaic would be too narrow to read.
     let panel = app.show_selection && width_rems >= PANEL_SHOWN_REMS;
-    if panel && let Some(path) = selection_checkout(app) {
-        app.ensure_git(&path, cx);
-    }
 
     let viewport = if app.tree().is_none() {
         // The first walk of a home directory takes long enough that an
@@ -488,19 +485,8 @@ fn explore(
         .child(key_bar(app, &theme, cx))
 }
 
-/// The selection, when it is a checkout git can say something about.
-fn selection_checkout(app: &Disktree) -> Option<std::path::PathBuf> {
-    let target = app.action_target()?;
-    let node = app.node_at(&target)?;
-    if !node.is_dir() {
-        return None;
-    }
-    let path = app.path_at(&target)?;
-    crate::git::is_checkout(&path).then_some(path)
-}
-
 /// Width, in rem, below which the side panel gives the mosaic its room.
-const PANEL_SHOWN_REMS: f32 = 52.0;
+pub const PANEL_SHOWN_REMS: f32 = 52.0;
 
 /// Window height, in rem, from which the disk stays pinned under the
 /// panel. Below it, pinning would leave the selection no room, so the disk
@@ -1335,6 +1321,11 @@ fn side_panel(
         .gap(space::LG)
         .p(space::LG)
         .child(selection_section(app, theme, cx))
+        .children(
+            crate::detail_cards::detail_sections(app, theme, cx)
+                .into_iter()
+                .flat_map(|section| [rule(), section]),
+        )
         .child(rule())
         .child(worth_section(app, theme, cx))
         .child(rule())
@@ -1518,24 +1509,7 @@ fn selection_section(
         ))
         .child(widgets::bar(share, highlight, cx));
 
-    let fourth = if node.is_dir()
-        && let Some(path) = &path
-        && crate::git::is_checkout(path)
-    {
-        let value = match app.git.get(path) {
-            Some(Some(state)) => state.summary(),
-            Some(None) => "not readable".to_string(),
-            None => "asking\u{2026}".to_string(),
-        };
-        let clean =
-            matches!(app.git.get(path), Some(Some(state)) if state.is_clean());
-        widgets::figure(
-            "Git",
-            value,
-            if clean { theme.success } else { theme.bright },
-            cx,
-        )
-    } else {
+    let fourth = {
         let kind = node.reclaim.map_or_else(
             || node.category.label().to_string(),
             |reason| {
@@ -3053,6 +3027,7 @@ fn mark_row(
         .children(
             blocked.map(|reason| widgets::chip(reason, theme.warning, cx)),
         )
+        .children(crate::detail_cards::review_chip(app, &item.path, theme, cx))
         .child(div().w(size::SHARE_LANE).flex_shrink_0().child(
             widgets::glyph_bar(
                 item.bytes,
