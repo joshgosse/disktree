@@ -668,6 +668,8 @@ mod tests {
 
     #[test]
     fn a_filtered_layout_shows_only_the_matches_at_their_size() {
+        use std::sync::atomic::AtomicBool;
+
         use crate::filter::filter;
         use crate::tree::{NodeKind, aggregate};
 
@@ -679,7 +681,8 @@ mod tests {
             vec![src, file("unit_test.txt", 100), file("huge.iso", 5000)];
         aggregate(&mut root, Metric::Bytes);
 
-        let matches = filter(&root, &[], "test").expect("needle");
+        let matches = filter(&root, &[], "test", &AtomicBool::new(false))
+            .expect("needle");
         let area = Rect::new(0.0, 0.0, 400.0, 400.0);
         let options = LayoutOptions {
             padding: 0.0,

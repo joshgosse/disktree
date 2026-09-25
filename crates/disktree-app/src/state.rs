@@ -8,6 +8,7 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use disktree_core::filter::{Keep, Matches, filter};
@@ -394,6 +395,8 @@ pub struct Disktree {
     filter_epoch: u64,
     /// Bumped per keystroke; only the newest search's result is kept.
     find_epoch: u64,
+    /// Set to stop the running search once a newer one supersedes it.
+    find_cancel: Arc<AtomicBool>,
     /// A search is running off the UI thread.
     pub finding: bool,
     /// Enter was pressed before the search finished: apply on arrival.
@@ -493,6 +496,7 @@ impl Disktree {
             filter_applied: false,
             filter_epoch: 0,
             find_epoch: 0,
+            find_cancel: Arc::default(),
             finding: false,
             apply_pending: false,
             show_help: false,
@@ -2013,9 +2017,10 @@ impl Disktree {
     ///
     /// Off the UI thread: a whole disk is millions of names, a few hundred
     /// milliseconds to search, and typing must not wait for it. Each
-    /// keystroke supersedes the search before it.
+    /// keystroke supersedes the search before it, and stops it.
     pub fn refresh_matches(&mut self, cx: &Context<'_, Self>) {
         self.find_epoch += 1;
+        self.find_cancel.store(true, Ordering::Relaxed);
         let epoch = self.find_epoch;
         let needle = self.find.clone();
         let Some(tree) =
@@ -2029,9 +2034,11 @@ impl Disktree {
         };
         self.finding = true;
         let base = self.crumbs.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.find_cancel = Arc::clone(&cancel);
         let task = cx.background_executor().spawn(async move {
             tree.resolve(&base)
-                .and_then(|node| filter(node, &base, &needle))
+                .and_then(|node| filter(node, &base, &needle, &cancel))
         });
         cx.spawn(async move |this, cx| {
             let found = task.await;
@@ -2094,6 +2101,7 @@ impl Disktree {
     /// Drop the find text and the filter with it.
     pub fn clear_filter(&mut self) {
         self.find_epoch += 1;
+        self.find_cancel.store(true, Ordering::Relaxed);
         self.finding = false;
         self.apply_pending = false;
         self.find.clear();

@@ -1379,10 +1379,11 @@ mod tests {
         let skipped =
             crate::space::foreign_mounts_for(&root).unwrap_or_default();
         println!("left out: {skipped:?}");
+        let never = std::sync::atomic::AtomicBool::new(false);
         for needle in ["c", "cache", "node_modules", "zzzz"] {
             let started = std::time::Instant::now();
-            let found =
-                crate::filter::filter(&tree, &[], needle).expect("needle");
+            let found = crate::filter::filter(&tree, &[], needle, &never)
+                .expect("needle");
             println!(
                 "filter {needle:?}: {} matches, {} in {:.1?}",
                 found.count,
