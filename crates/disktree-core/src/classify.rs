@@ -130,12 +130,15 @@ pub fn category_of_name(name: &str, parent: Option<&str>) -> Option<Category> {
         ) => return Some(Category::Media),
         _ => {}
     }
-    let in_library =
-        parent.is_some_and(|parent| parent.eq_ignore_ascii_case("library"));
+    let under = |wanted: &str| {
+        parent.is_some_and(|parent| parent.eq_ignore_ascii_case(wanted))
+    };
     let category = match lower.as_str() {
         // macOS: ~/Library/Developer is Xcode's own state, and ~/Developer
-        // is where Xcode puts projects.
-        "developer" if in_library => Category::Toolchain,
+        // is where Xcode puts projects. Inside an app bundle,
+        // `Contents/Developer` is part of the app.
+        "developer" if under("library") => Category::Toolchain,
+        "developer" if under("contents") => return None,
         "src" | "code" | "projects" | "repos" | "dev" | "work"
         | "workspace" | "workspaces" | "github.com" | "gitlab.com"
         | "sites" | "development" | "developer" | "xcode projects" => {
@@ -173,7 +176,9 @@ pub fn category_of_name(name: &str, parent: Option<&str>) -> Option<Category> {
         | "models" | ".ollama" | ".lmstudio" | "games" | "wineprefix" => {
             Category::Media
         }
-        "applications" => Category::Apps,
+        // Linux has `applications` too, of launcher entries, which the
+        // legend does not name.
+        "applications" if cfg!(target_os = "macos") => Category::Apps,
         "documents" | "desktop" | "downloads" | "books" | "notes"
         | "obsidian" | "public" | "templates" => Category::Documents,
         ".cache" | "cache" | "caches" | ".ccache" | ".sccache" | "_cacache"
@@ -619,10 +624,20 @@ mod tests {
             named(&home, &["Library", "Mobile Documents"]).category,
             Category::Synced
         );
-        assert_eq!(named(&home, &["Applications"]).category, Category::Apps);
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                named(&home, &["Applications"]).category,
+                Category::Apps
+            );
+        }
         assert_eq!(
             named(&home, &["Applications", "Xcode.app"]).category,
             Category::Apps
+        );
+        assert_eq!(
+            category_of_name("Developer", Some("Contents")),
+            None,
+            "Xcode.app/Contents/Developer is part of the app"
         );
         // A bundle is an app wherever it sits, not only in Applications.
         assert_eq!(
