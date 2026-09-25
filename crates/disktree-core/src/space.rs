@@ -73,6 +73,34 @@ pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
     })
 }
 
+/// Space macOS frees on demand on the volume containing `path`.
+///
+/// Purgeable caches and local copies of what is in iCloud: Finder counts
+/// them as available and `statfs` does not.
+#[cfg(target_os = "macos")]
+pub fn purgeable_bytes(path: &Path) -> Option<u64> {
+    crate::macos::purgeable_bytes(path)
+}
+
+/// Only macOS reports purgeable space.
+#[cfg(not(target_os = "macos"))]
+pub const fn purgeable_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// The name Finder shows for the volume holding `path`, such as
+/// `Macintosh HD`.
+#[cfg(target_os = "macos")]
+pub fn volume_name(path: &Path) -> Option<String> {
+    crate::macos::volume_name(path)
+}
+
+/// Only macOS is asked for a volume's name.
+#[cfg(not(target_os = "macos"))]
+pub const fn volume_name(_path: &Path) -> Option<String> {
+    None
+}
+
 /// The volume a path is on, as Windows names it: `C:\`, a share, or the
 /// folder a volume is mounted on.
 #[cfg(windows)]
@@ -460,6 +488,22 @@ map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)
         assert_eq!(volume_root_for(&home), Some(PathBuf::from("/")));
         let device = device_for(Path::new("/")).expect("a device");
         assert!(device.starts_with("/dev/disk"), "{device}");
+    }
+
+    #[test]
+    fn only_macos_names_the_volume_and_its_purgeable_space() {
+        let name = volume_name(Path::new("/"));
+        let purgeable = purgeable_bytes(Path::new("/"));
+        if cfg!(target_os = "macos") {
+            assert!(name.as_ref().is_some_and(|name| !name.is_empty()));
+            assert!(purgeable.is_some(), "any amount, even none");
+        } else {
+            assert_eq!(name, None);
+            assert_eq!(purgeable, None);
+        }
+        let missing = Path::new("/definitely/not/here");
+        assert_eq!(volume_name(missing), None);
+        assert_eq!(purgeable_bytes(missing), None);
     }
 
     #[test]

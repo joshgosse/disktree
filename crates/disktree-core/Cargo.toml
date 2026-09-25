@@ -29,6 +29,18 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 # Linux and Windows code is not built.
 [target.'cfg(target_os = "macos")'.dependencies]
 trash = { version = "5.2.9", default-features = false }
+# A volume's name and purgeable space, which only Foundation reports; see
+# `macos.rs`. The versions `trash` already builds on.
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSDictionary",
+    "NSError",
+    "NSString",
+    "NSURL",
+    "NSValue",
+] }
 
 [dev-dependencies]
 tempfile = "3"

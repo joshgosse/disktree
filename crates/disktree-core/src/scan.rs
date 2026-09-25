@@ -43,7 +43,9 @@ pub struct ScanOptions {
     /// Follow symlinks. Off by default: a home directory is full of links, and
     /// following them double-counts.
     pub follow_links: bool,
-    /// Include dotfiles and dot-directories. On by default, like dust and `du`:
+    /// Include dotfiles and dot-directories, and what the file manager hides
+    /// by an attribute: Explorer's hidden attribute on Windows, Finder's
+    /// `UF_HIDDEN` flag on macOS. On by default, like dust and `du`:
     /// `~/.cache` is frequently the largest directory in a home directory.
     pub include_hidden: bool,
     /// Stay on the root's volume: skip other disks, pseudo filesystems,
@@ -86,6 +88,7 @@ pub struct ScanProgress {
     dirs: AtomicU64,
     bytes: AtomicU64,
     errors: AtomicU64,
+    walked: AtomicBool,
     finished: AtomicBool,
     cancelled: AtomicBool,
     messages: Mutex<Vec<String>>,
@@ -98,6 +101,9 @@ pub struct ScanSnapshot {
     pub dirs: u64,
     pub bytes: u64,
     pub errors: u64,
+    /// The walk is over and the tree is being totalled, de-duplicated and
+    /// classified: the counts stop moving without anything being stuck.
+    pub walked: bool,
     pub finished: bool,
     pub cancelled: bool,
     /// Up to [`MAX_ERROR_DETAIL`] unreadable paths, most recent last.
@@ -125,6 +131,10 @@ impl ScanProgress {
         drop(messages);
     }
 
+    fn finish_walking(&self) {
+        self.walked.store(true, Ordering::Relaxed);
+    }
+
     fn finish(&self) {
         self.finished.store(true, Ordering::Relaxed);
     }
@@ -145,6 +155,7 @@ impl ScanProgress {
             dirs: self.dirs.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            walked: self.walked.load(Ordering::Relaxed),
             finished: self.finished.load(Ordering::Relaxed),
             cancelled: self.is_cancelled(),
             messages: lock(&self.messages).clone(),
@@ -463,9 +474,10 @@ trait Listed {
     fn facts(&self, apparent_size: bool) -> io::Result<Facts>;
     /// What a directory is, read before the walk enters it.
     fn directory(&self) -> io::Result<Directory>;
-    /// Hidden by an attribute rather than by a leading dot: on Windows,
-    /// where the listing carries it, so `AppData` is hidden as Explorer
-    /// hides it. macOS's `UF_HIDDEN` would cost a stat per entry.
+    /// Hidden by an attribute rather than by a leading dot, as the file
+    /// manager hides it: `AppData` in Explorer, `~/Library` in Finder. Only
+    /// asked when hidden entries are skipped, because on macOS it costs a
+    /// stat per entry; on Windows the listing carries it.
     fn hidden(&self) -> bool {
         false
     }
@@ -547,6 +559,13 @@ impl Listed for DirEntry {
             device: device_of(&meta),
             evicted: is_dataless(&meta),
         })
+    }
+
+    /// The entry's own flags, not a link target's: `DirEntry::metadata`
+    /// does not follow links.
+    #[cfg(target_os = "macos")]
+    fn hidden(&self) -> bool {
+        self.metadata().is_ok_and(|meta| is_flagged_hidden(&meta))
     }
 }
 
@@ -699,6 +718,7 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
 
     let root_dir = Arc::new(PendingDir::new(root.to_path_buf(), None, 0));
     rayon::scope(|scope| walk(scope, &root_dir, context));
+    context.progress.finish_walking();
 
     let node = lock(&context.root).take();
     let node = node.ok_or_else(|| {
@@ -886,6 +906,16 @@ fn is_dataless(meta: &Metadata) -> bool {
 #[cfg(not(target_os = "macos"))]
 const fn is_dataless(_meta: &Metadata) -> bool {
     false
+}
+
+/// Whether Finder hides the entry by its flag rather than its name, as it
+/// hides `~/Library`.
+#[cfg(target_os = "macos")]
+fn is_flagged_hidden(meta: &Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt as _;
+    // `UF_HIDDEN` from <sys/stat.h>.
+    const UF_HIDDEN: u32 = 0x8000;
+    meta.st_flags() & UF_HIDDEN != 0
 }
 
 /// Whether the file has more than one name, so the walk can count it twice.
@@ -1120,6 +1150,34 @@ mod tests {
         assert_eq!(without.bytes, 100);
     }
 
+    /// Finder's hidden flag counts as hidden, as `~/Library` has it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_hidden_flag_hides_an_entry_on_macos() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        write(root, "Library/blob.bin", 900);
+        write(root, "visible.bin", 100);
+        let marked = std::process::Command::new("/usr/bin/chflags")
+            .arg("hidden")
+            .arg(root.join("Library"))
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(marked, "chflags hidden");
+
+        let default = scan_dir(root, &options());
+        assert_eq!(child(&default, "Library").bytes, 900);
+        let without = scan_dir(
+            root,
+            &ScanOptions {
+                include_hidden: false,
+                ..options()
+            },
+        );
+        assert_eq!(without.bytes, 100);
+        assert!(without.child_named("Library").is_none());
+    }
+
     /// A link to a directory: a symbolic link on Unix, a junction on
     /// Windows, which needs no privilege to make. `false` if it could not be
     /// made.
@@ -1310,6 +1368,7 @@ mod tests {
         assert_eq!(tree.bytes, 3072);
 
         let snapshot = handle.progress.snapshot();
+        assert!(snapshot.walked);
         assert!(snapshot.finished);
         assert_eq!(snapshot.files, 2);
         assert_eq!(snapshot.errors, 0);

@@ -98,7 +98,8 @@ and `cargo build --release` directly; CI runs the gate on both systems.
 | tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |
 | anything that deletes, or refuses to | `crates/disktree-core/src/removal.rs` |
 | free space and projections | `crates/disktree-core/src/space.rs` |
-| what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — the only `unsafe` |
+| what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — with `macos.rs`, the only `unsafe` |
+| what only macOS's Foundation reports: a volume's name, its purgeable space | `crates/disktree-core/src/macos.rs` — with `windows.rs`, the only `unsafe` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |
