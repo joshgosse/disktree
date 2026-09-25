@@ -64,6 +64,8 @@ fmt:
 	$(CARGO) xtask fmt-fix
 
 ifeq ($(UNAME),Darwin)
+LSREGISTER = /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
 # Replaced whole rather than copied over: a stale file left inside a signed
 # bundle breaks its signature.
 install:
@@ -72,6 +74,8 @@ install:
 	rm -rf "$(APPS)/disktree.app"
 	ditto "$(BUNDLE)" "$(APPS)/disktree.app"
 	ln -sf "$(APPS)/disktree.app/Contents/MacOS/disktree" "$(BINDIR)/disktree"
+	@# So the Finder's Open With lists it for folders straight away.
+	$(LSREGISTER) -f "$(APPS)/disktree.app"
 	@echo
 	@echo "installed:"
 	@echo "  $(APPS)/disktree.app"

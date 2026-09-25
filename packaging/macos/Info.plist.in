@@ -29,6 +29,10 @@
 	<string>public.app-category.utilities</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<!-- A hidden window may be walking a disk or removing what was marked;
+	     macOS must not end it to reclaim memory. -->
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
 	<key>NSHumanReadableCopyright</key>
 	<string>MIT License</string>
 	<!-- Shown in the prompts macOS raises the first time a scan reaches
@@ -44,5 +48,23 @@
 	<string>disktree measures removable disks you scan to show what is using them. It reads sizes and names only.</string>
 	<key>NSNetworkVolumesUsageDescription</key>
 	<string>disktree measures network disks you scan to show what is using them. It reads sizes and names only.</string>
+	<!-- Folders only, and never as their default app: the Finder offers
+	     disktree under Open With, and a folder dropped on its Dock icon is
+	     scanned. -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Folder</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.folder</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>
