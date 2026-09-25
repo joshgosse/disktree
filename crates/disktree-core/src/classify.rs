@@ -28,6 +28,8 @@ pub enum Category {
     Git,
     /// Pictures, music, video, games and models.
     Media,
+    /// Application bundles and the folders holding them.
+    Apps,
     /// Documents, downloads and the desktop.
     Documents,
     /// Caches and other regenerable state.
@@ -38,14 +40,17 @@ pub enum Category {
 }
 
 impl Category {
-    /// The categories the legend lists, in its order.
-    pub const LEGEND: [Self; 8] = [
+    /// The categories the legend lists, in its order. Apps are listed only
+    /// on macOS, the one system that installs them as bundles.
+    pub const LEGEND: &[Self] = &[
         Self::Code,
         Self::AgentScratch,
         Self::Toolchain,
         Self::Synced,
         Self::Git,
         Self::Media,
+        #[cfg(target_os = "macos")]
+        Self::Apps,
         Self::Documents,
         Self::Cache,
     ];
@@ -58,6 +63,7 @@ impl Category {
             Self::Synced => "Synced",
             Self::Git => "Git",
             Self::Media => "Media",
+            Self::Apps => "Apps",
             Self::Documents => "Documents",
             Self::Cache => "Cache",
             Self::Other => "Other",
@@ -105,18 +111,36 @@ impl Reclaim {
     }
 }
 
-/// The kind a directory name announces on its own, if any.
-pub fn category_of_name(name: &str) -> Option<Category> {
+/// The kind a directory name announces, if any. `parent`, the name of the
+/// directory holding it, tells apart the few names that mean two things.
+pub fn category_of_name(name: &str, parent: Option<&str>) -> Option<Category> {
     let lower = name.to_ascii_lowercase();
     // Windows: a work or school account's folder carries the organisation,
     // `OneDrive - Contoso`, and Dropbox's does the same, `Dropbox (Contoso)`.
     if lower.starts_with("onedrive - ") || lower.starts_with("dropbox (") {
         return Some(Category::Synced);
     }
+    // macOS: application bundles, and the bundles Photos, Music, TV, Final
+    // Cut Pro, iMovie, Logic Pro and GarageBand keep libraries and projects in.
+    match lower.rsplit_once('.').map(|(_, extension)| extension) {
+        Some("app") => return Some(Category::Apps),
+        Some(
+            "photoslibrary" | "musiclibrary" | "tvlibrary" | "fcpbundle"
+            | "imovielibrary" | "logicx" | "band",
+        ) => return Some(Category::Media),
+        _ => {}
+    }
+    let in_library =
+        parent.is_some_and(|parent| parent.eq_ignore_ascii_case("library"));
     let category = match lower.as_str() {
+        // macOS: ~/Library/Developer is Xcode's own state, and ~/Developer
+        // is where Xcode puts projects.
+        "developer" if in_library => Category::Toolchain,
         "src" | "code" | "projects" | "repos" | "dev" | "work"
         | "workspace" | "workspaces" | "github.com" | "gitlab.com"
-        | "sites" | "development" => Category::Code,
+        | "sites" | "development" | "developer" | "xcode projects" => {
+            Category::Code
+        }
         ".codex" | ".claude" | ".herdr" | ".pi" | ".cursor" | ".aider"
         | ".gemini" | ".continue" | ".windsurf" | ".microsandbox" | ".omp"
         | ".agents" | ".openai" | "tries" | "worktrees" | "experiments"
@@ -127,15 +151,21 @@ pub fn category_of_name(name: &str) -> Option<Category> {
         | ".espressif" | ".arduino15" | ".config" | ".vscode" | ".zig"
         | ".rye" | ".conda" | "anaconda3" | "miniconda3" | ".opam"
         | ".ghcup" | ".stack" | ".julia" | ".dotnet" | ".android"
-        | ".sdkman" | ".volta" | ".yarn" | ".java" | ".nuget"
+        | ".sdkman" | ".volta" | ".yarn" | ".java" | ".nuget" | ".swiftpm"
+        | ".docker" | ".orbstack" | ".colima" | ".lima"
+        // macOS: Homebrew's prefix, Android Studio's SDK in ~/Library,
+        // Docker Desktop's container and the Command Line Tools.
+        | "homebrew" | ".homebrew" | "android" | "com.docker.docker"
+        | "commandlinetools"
         // macOS: Xcode's and the simulators' state in ~/Library/Developer.
-        // Not `Developer` itself: ~/Developer is where Apple puts projects.
         | "xcode" | "coresimulator" => Category::Toolchain,
         "sync" | "dropbox" | "nextcloud" | "google drive" | "onedrive"
         | "pclouddrive" | "mega" | ".stversions"
         // macOS: iCloud Drive, and the File Provider clients (Dropbox,
         // Google Drive, OneDrive) since macOS 12.
-        | "mobile documents" | "cloudstorage"
+        | "mobile documents" | "icloud drive" | "cloudstorage"
+        // macOS: iPhone and iPad backups, in ~/Library/Application Support.
+        | "mobilesync"
         // Windows: iCloud for Windows.
         | "iclouddrive" => Category::Synced,
         ".git" => Category::Git,
@@ -143,12 +173,14 @@ pub fn category_of_name(name: &str) -> Option<Category> {
         | "models" | ".ollama" | ".lmstudio" | "games" | "wineprefix" => {
             Category::Media
         }
+        "applications" => Category::Apps,
         "documents" | "desktop" | "downloads" | "books" | "notes"
         | "obsidian" | "public" | "templates" => Category::Documents,
         ".cache" | "cache" | "caches" | ".ccache" | ".sccache" | "_cacache"
         | "__pycache__" | "node_modules" | "trash" | ".trash" | "tmp"
         | ".tmp" | "deriveddata" | "ios devicesupport"
-        | "watchos devicesupport"
+        | "watchos devicesupport" | "tvos devicesupport"
+        | "xros devicesupport"
         // Windows: see `reclaim_of`.
         | "temp" | "$recycle.bin" | "npm-cache" | "v3-cache" | "inetcache"
         | "d3dscache" | "dxcache" | "glcache" | "crashdumps" => Category::Cache,
@@ -174,7 +206,8 @@ pub fn reclaim_of(
         | "glcache"
         // Symbols Xcode copies off a device it meets, and copies again the
         // next time that device is plugged in.
-        | "ios devicesupport" | "watchos devicesupport" => Reclaim::Regenerable,
+        | "ios devicesupport" | "watchos devicesupport"
+        | "tvos devicesupport" | "xros devicesupport" => Reclaim::Regenerable,
         ".stversions" => Reclaim::SyncHistory,
         ".pnpm-store" | "pnpm" => Reclaim::PackageStore,
         "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache"
@@ -185,7 +218,9 @@ pub fn reclaim_of(
         "logs" if has_sibling("Application Support") => Reclaim::Temporary,
         // Too common to trust alone: only a build directory beside a manifest.
         "target" if has_sibling("Cargo.toml") => Reclaim::BuildOutput,
+        ".build" if has_sibling("Package.swift") => Reclaim::BuildOutput,
         "node_modules" if has_sibling("package.json") => Reclaim::Reinstallable,
+        "pods" if has_sibling("Podfile") => Reclaim::Reinstallable,
         // Layers and snapshots are only disposable inside sandbox state.
         "layers" if parent == Category::AgentScratch => Reclaim::SandboxLayers,
         "snapshots" if parent == Category::AgentScratch => Reclaim::Snapshots,
@@ -215,7 +250,7 @@ pub fn classify(root: &mut Node) {
         let child = &mut root.children[index];
         // A top-level directory with an unknown name takes the kind of its
         // largest recognisable child: `~/world` is mostly `.git`.
-        let category = category_of_name(&child.name)
+        let category = category_of_name(&child.name, Some(&root.name))
             .or_else(|| is_git_store(child).then_some(Category::Git))
             .or_else(|| dominant_child_category(child))
             .unwrap_or(Category::Other);
@@ -246,7 +281,7 @@ fn classify_below(
         let has_sibling =
             |wanted: &str| names.iter().any(|name| &**name == wanted);
         let child_category = if child.is_dir() {
-            category_of_name(&child.name)
+            category_of_name(&child.name, Some(&node.name))
                 .or_else(|| is_git_store(child).then_some(Category::Git))
                 .unwrap_or(category)
         } else {
@@ -272,7 +307,7 @@ fn dominant_child_category(node: &Node) -> Option<Category> {
             .iter()
             .filter(|child| child.is_dir())
             .find_map(|child| {
-                category_of_name(&child.name)
+                category_of_name(&child.name, Some(&node.name))
                     .or_else(|| is_git_store(child).then_some(Category::Git))
             })
         {
@@ -356,6 +391,53 @@ mod tests {
                         ],
                     )],
                 ),
+                dir(
+                    "Library",
+                    vec![
+                        dir(
+                            "Caches",
+                            vec![dir("com.apple.Safari", vec![file("j", 30)])],
+                        ),
+                        dir(
+                            "Developer",
+                            vec![dir(
+                                "Xcode",
+                                vec![dir(
+                                    "DerivedData",
+                                    vec![dir("App-abc", vec![file("k", 40)])],
+                                )],
+                            )],
+                        ),
+                        dir("Mobile Documents", vec![file("l", 2)]),
+                    ],
+                ),
+                dir("Developer", vec![dir("app", vec![file("main.swift", 3)])]),
+                dir(
+                    "Applications",
+                    vec![dir("Xcode.app", vec![file("m", 60)])],
+                ),
+                dir(
+                    "Downloads",
+                    vec![dir("Installer.app", vec![file("n", 9)])],
+                ),
+                dir(
+                    "Pictures",
+                    vec![dir(
+                        "Photos Library.photoslibrary",
+                        vec![file("o", 70)],
+                    )],
+                ),
+                dir(
+                    "swift-thing",
+                    vec![
+                        file("Package.swift", 1),
+                        dir(".build", vec![file("p", 8)]),
+                    ],
+                ),
+                dir(
+                    "ios-thing",
+                    vec![file("Podfile", 1), dir("Pods", vec![file("q", 6)])],
+                ),
             ],
         );
         aggregate(&mut home, Metric::Bytes);
@@ -422,6 +504,10 @@ mod tests {
             Some(Reclaim::SyncHistory)
         );
         assert_eq!(named(&home, &["src"]).reclaim, None);
+        assert_eq!(
+            named(&home, &["Library", "Caches", "com.apple.Safari"]).reclaim,
+            Some(Reclaim::Regenerable)
+        );
     }
 
     #[test]
@@ -432,6 +518,22 @@ mod tests {
             Some(Reclaim::BuildOutput)
         );
         assert_eq!(named(&home, &["js-thing", "target"]).reclaim, None);
+    }
+
+    #[test]
+    fn swift_builds_and_pods_are_reclaimable_only_beside_their_manifest() {
+        let home = home();
+        assert_eq!(
+            named(&home, &["swift-thing", ".build"]).reclaim,
+            Some(Reclaim::BuildOutput)
+        );
+        assert_eq!(
+            named(&home, &["ios-thing", "Pods"]).reclaim,
+            Some(Reclaim::Reinstallable)
+        );
+        let none = |_: &str| false;
+        assert_eq!(reclaim_of(".build", Category::Code, none), None);
+        assert_eq!(reclaim_of("Pods", Category::Code, none), None);
     }
 
     #[test]
@@ -461,10 +563,23 @@ mod tests {
             reclaim_of("DerivedData", Category::Toolchain, none),
             Some(Reclaim::BuildOutput)
         );
-        assert_eq!(
-            reclaim_of("iOS DeviceSupport", Category::Toolchain, none),
-            Some(Reclaim::Regenerable)
-        );
+        for name in [
+            "iOS DeviceSupport",
+            "watchOS DeviceSupport",
+            "tvOS DeviceSupport",
+            "xrOS DeviceSupport",
+        ] {
+            assert_eq!(
+                reclaim_of(name, Category::Toolchain, none),
+                Some(Reclaim::Regenerable),
+                "{name}"
+            );
+            assert_eq!(
+                category_of_name(name, Some("Xcode")),
+                Some(Category::Cache),
+                "{name}"
+            );
+        }
         let library = |name: &str| name == "Application Support";
         assert_eq!(
             reclaim_of("Logs", Category::Other, library),
@@ -476,12 +591,104 @@ mod tests {
         assert_eq!(reclaim_of("Archives", Category::Toolchain, none), None);
         assert_eq!(reclaim_of("Backup", Category::Other, none), None);
         assert_eq!(
-            category_of_name("Mobile Documents"),
+            category_of_name("Mobile Documents", Some("Library")),
             Some(Category::Synced)
         );
-        // ~/Developer holds a user's projects, not a toolchain.
-        assert_eq!(category_of_name("Developer"), None);
-        assert_eq!(category_of_name("Xcode"), Some(Category::Toolchain));
+        assert_eq!(
+            category_of_name("Xcode", Some("Developer")),
+            Some(Category::Toolchain)
+        );
+    }
+
+    #[test]
+    fn macos_folders_are_recognised() {
+        let home = home();
+        // ~/Developer is where Xcode puts projects; ~/Library/Developer is
+        // Xcode's own state, told apart only by the parent.
+        assert_eq!(named(&home, &["Developer"]).category, Category::Code);
+        assert_eq!(
+            named(&home, &["Library", "Developer"]).category,
+            Category::Toolchain
+        );
+        assert_eq!(
+            named(&home, &["Library", "Developer", "Xcode", "DerivedData"])
+                .reclaim,
+            Some(Reclaim::BuildOutput)
+        );
+        assert_eq!(
+            named(&home, &["Library", "Mobile Documents"]).category,
+            Category::Synced
+        );
+        assert_eq!(named(&home, &["Applications"]).category, Category::Apps);
+        assert_eq!(
+            named(&home, &["Applications", "Xcode.app"]).category,
+            Category::Apps
+        );
+        // A bundle is an app wherever it sits, not only in Applications.
+        assert_eq!(
+            named(&home, &["Downloads", "Installer.app"]).category,
+            Category::Apps
+        );
+        assert_eq!(
+            named(&home, &["Pictures", "Photos Library.photoslibrary"])
+                .category,
+            Category::Media
+        );
+        assert_eq!(
+            category_of_name("developer", Some("LIBRARY")),
+            Some(Category::Toolchain)
+        );
+        assert_eq!(category_of_name("Developer", None), Some(Category::Code));
+    }
+
+    #[test]
+    fn app_and_media_bundles_are_known_by_their_suffix() {
+        for name in ["Safari.app", "Old Thing.APP"] {
+            assert_eq!(
+                category_of_name(name, None),
+                Some(Category::Apps),
+                "{name}"
+            );
+        }
+        for name in [
+            "Photos Library.photoslibrary",
+            "Music Library.musiclibrary",
+            "TV Library.tvlibrary",
+            "Untitled.fcpbundle",
+            "iMovie Library.imovielibrary",
+            "Song.logicx",
+            "Demo.band",
+            "Shouting.PHOTOSLIBRARY",
+        ] {
+            assert_eq!(
+                category_of_name(name, None),
+                Some(Category::Media),
+                "{name}"
+            );
+        }
+        assert_eq!(category_of_name("app", None), None);
+    }
+
+    #[test]
+    fn the_macs_toolchains_and_sync_folders_are_recognised() {
+        for (name, category) in [
+            ("Xcode Projects", Category::Code),
+            (".swiftpm", Category::Toolchain),
+            ("Homebrew", Category::Toolchain),
+            (".homebrew", Category::Toolchain),
+            ("Android", Category::Toolchain),
+            (".docker", Category::Toolchain),
+            ("com.docker.docker", Category::Toolchain),
+            (".orbstack", Category::Toolchain),
+            (".colima", Category::Toolchain),
+            (".lima", Category::Toolchain),
+            ("CommandLineTools", Category::Toolchain),
+            ("CoreSimulator", Category::Toolchain),
+            ("iCloud Drive", Category::Synced),
+            ("MobileSync", Category::Synced),
+        ] {
+            assert_eq!(category_of_name(name, None), Some(category), "{name}");
+        }
     }
 
     #[test]
@@ -502,26 +709,35 @@ mod tests {
                 Some(reclaim),
                 "{name}"
             );
-            assert_eq!(category_of_name(name), Some(Category::Cache), "{name}");
+            assert_eq!(
+                category_of_name(name, None),
+                Some(Category::Cache),
+                "{name}"
+            );
         }
         for name in ["OneDrive - Contoso", "Dropbox (Contoso)", "iCloudDrive"] {
             assert_eq!(
-                category_of_name(name),
+                category_of_name(name, None),
                 Some(Category::Synced),
                 "{name}"
             );
         }
-        assert_eq!(category_of_name(".nuget"), Some(Category::Toolchain));
-        assert_eq!(category_of_name("OneDriveSetup"), None);
+        assert_eq!(category_of_name(".nuget", None), Some(Category::Toolchain));
+        assert_eq!(category_of_name("OneDriveSetup", None), None);
     }
 
     #[test]
     fn the_legend_lists_every_named_category_once() {
         let mut seen = std::collections::HashSet::new();
-        for category in Category::LEGEND {
+        for &category in Category::LEGEND {
             assert!(seen.insert(category));
             assert_ne!(category, Category::Other);
             assert!(!category.label().is_empty());
         }
+        assert_eq!(
+            Category::LEGEND.contains(&Category::Apps),
+            cfg!(target_os = "macos"),
+            "apps are listed only where they are bundles"
+        );
     }
 }
