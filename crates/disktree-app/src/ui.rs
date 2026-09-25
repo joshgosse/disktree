@@ -82,6 +82,14 @@ pub mod size {
     pub const SCANNING_METER: Rems = Rems(26.25);
     /// The Size | Files | Age choice in the settings row.
     pub const RANKING_CHOICE: Rems = Rems(11.0);
+    /// The Treemap | Sunburst | Icicle choice beside it.
+    pub const CHART_CHOICE: Rems = Rems(15.0);
+    /// A tile's right-click menu, at its narrowest.
+    pub const CONTEXT_MENU: Rems = Rems(13.0);
+    /// A card the disk section opens.
+    pub const DETAIL_CARD: Rems = Rems(20.0);
+    /// The unreadable paths listed in that card, before they scroll.
+    pub const UNREADABLE_LIST: Rems = Rems(8.75);
     /// The review screen's summary column.
     pub const REVIEW_SUMMARY: Rems = Rems(22.5);
     /// The review list's share-bar lane.
@@ -101,3 +109,11 @@ pub const ZOOM_STEPS: [f32; 7] = [0.75, 0.875, 1.0, 1.125, 1.25, 1.5, 1.75];
 
 /// The default rem, in pixels.
 pub const BASE_REM: f32 = 16.0;
+
+/// Where macOS draws the window buttons in the top bar, in points from the
+/// window's corner, and the room the bar leaves them. The buttons are 14 pt
+/// tall, so this centres them on the bar at the default `rem`; since macOS
+/// 26 the three span about 60 pt.
+pub const TRAFFIC_LIGHTS_X: f32 = 16.0;
+pub const TRAFFIC_LIGHTS_Y: f32 = 24.0;
+pub const TRAFFIC_LIGHTS_ROOM: f32 = 90.0;

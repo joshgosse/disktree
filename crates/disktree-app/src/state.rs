@@ -11,32 +11,38 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use disktree_core::camera::LevelTransition;
 use disktree_core::filter::{Keep, Matches, filter};
 use disktree_core::insights::{Candidate, worth_a_look};
+use disktree_core::partition::{Partition, partition};
 use disktree_core::removal::{
-    Plan, RemovalEvent, RemovalHandle, RemovalMode, Target, TrashBackend,
-    detect_trash_backend, plan,
+    Plan, RemovalEvent, RemovalHandle, RemovalMode, RemovalProgress, Target,
+    TrashBackend, detect_trash_backend, plan,
 };
 use disktree_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
 use disktree_core::space::{
-    SpaceInfo, device_for, space_info, volume_root_for,
+    SpaceInfo, device_for, purgeable_bytes, space_info, volume_name,
+    volume_root_for,
 };
 use disktree_core::tree::{Metric, Node, path_of};
 use disktree_core::treemap::{
-    LayoutOptions, Rect, Tile, TileKind, hit, layout_filtered,
+    LayoutOptions, REST, Rect, Tile, TileKind, hit, is_rest, layout_filtered,
 };
 use gpui_kit::{
     Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, NavigationDirection, Pixels, Point, Render, ScrollDelta,
-    ScrollWheelEvent, Size, Window, px, size,
+    MouseMoveEvent, NavigationDirection, PinchEvent, Pixels, Point, Render,
+    ScrollDelta, ScrollHandle, ScrollWheelEvent, Size, TouchPhase, Window, px,
+    size,
 };
 use gpui_omarchy::Status;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::charts::{Chart, ChartGeometry, Location, clipped};
 use crate::git::GitState;
-
 use crate::marks::{Marks, display_path, is_hidden};
-use crate::treemap_view::{Mosaic, TileDeco};
+use crate::settings::Settings;
+use crate::themes::ThemeChoice;
+use crate::treemap_view::{CenterLabel, Mosaic, TileDeco};
 
 /// What a tile's colour says.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -81,7 +87,120 @@ pub enum Crumb {
     Above(PathBuf),
     /// A directory in the tree, by crumbs from the scanned root.
     Tree(Vec<usize>),
+    /// The drawn directory's smaller items, this many "+N more" pages in.
+    Rest(usize),
 }
+
+/// A "+N more" tile opened in the drawn directory: how many of its largest
+/// children the page leaves out, and how many it stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestPage {
+    pub skipped: usize,
+    pub count: usize,
+}
+
+/// What a drawn "+N more" tile stands for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rest {
+    /// Crumbs of the directory whose smaller items it holds.
+    pub parent: Vec<usize>,
+    pub count: usize,
+    pub bytes: u64,
+    pub files: u64,
+    pub rect: Rect,
+}
+
+/// A detail the disk section opens over the panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelDetail {
+    /// What could not be read, and how to include it.
+    Unreadable,
+    /// Why the Finder shows more free space.
+    Purgeable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextMenu {
+    /// Where it opened, in window coordinates.
+    pub position: Point<Pixels>,
+    /// By path, not crumbs: a scan can land while the menu is open and
+    /// re-address every tile.
+    pub target: MenuTarget,
+    /// The row the arrow keys are on.
+    pub highlighted: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuTarget {
+    Node(PathBuf),
+    /// A "+N more" tile, by the directory whose smaller items it holds.
+    Rest(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MenuRow {
+    pub label: String,
+    pub action: MenuAction,
+    /// A rule is drawn above it.
+    pub separated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MenuAction {
+    Open,
+    OpenRest,
+    ToggleMark,
+    Unmark(PathBuf),
+    Reveal(PathBuf),
+    CopyPath,
+}
+
+/// A level change in flight, with the level it is leaving.
+#[derive(Clone, Debug)]
+pub struct LevelChange {
+    pub transition: LevelTransition,
+    /// The level on screen when it began, as last drawn.
+    outgoing: Vec<Decorated>,
+    /// The tile the inner level stands for in the outer one: the outer
+    /// level's tiles inside it give way to the inner level's.
+    focus: Vec<usize>,
+}
+
+/// A tile decorated for the frame, still in its level's layout space, so a
+/// level change can move it. Label text is only made for tiles with room.
+#[derive(Clone, Debug)]
+struct Decorated {
+    crumbs: Vec<usize>,
+    tile: TileDeco,
+    header: Option<Rect>,
+    /// A "+N more" tile's count, bytes and files.
+    rest: Option<(usize, u64, u64)>,
+}
+
+/// A scroll or pinch gesture as it goes.
+///
+/// A trackpad sends a stream of small deltas and then momentum; a gesture
+/// stops zooming once it has changed level, since magnifying on would leave
+/// the next directory bigger than the screen, and going into it would zoom
+/// back out.
+#[derive(Clone, Copy, Debug, Default)]
+struct Gesture {
+    level_changed: bool,
+    /// Between a phase that started and one that ended.
+    touching: bool,
+    /// Deltas since the fingers let go, and before a pause.
+    momentum: bool,
+    last: Option<Instant>,
+}
+
+/// Some mice send smooth deltas with no gesture phases at all; for them a
+/// pause is what ends a gesture.
+const GESTURE_PAUSE: Duration = Duration::from_millis(300);
+
+/// No entry read for this long while the walk is still going: on macOS a
+/// permission dialog holds `open()` on a protected folder until it is
+/// answered.
+const STALL: Duration = Duration::from_secs(3);
 
 /// The side panel's width in rem: default and limits. In rem, so interface
 /// zoom scales it with everything it holds.
@@ -212,76 +331,6 @@ impl View {
     }
 }
 
-/// A layout transition: the region the user is looking at, and where that same
-/// region lands in the layout being switched to.
-///
-/// Every descending or ascending move is one region of the tree changing
-/// address. Rather than moving a camera, each tile is drawn from where that
-/// region *was* to where it *is*, so the tiles inside the directory that is
-/// being entered grow into place and the ones being left slide out. That is
-/// what makes "zoom in and descend" read as one motion: the newly visible
-/// level is always larger than it was a moment ago, never smaller.
-#[derive(Clone, Copy, Debug)]
-pub struct LayoutTransition {
-    /// The region in the old frame, in viewport coordinates.
-    src: Rect,
-    /// The same region in the new frame, in viewport coordinates.
-    dst: Rect,
-    started: Instant,
-    duration: Duration,
-}
-
-impl LayoutTransition {
-    fn new(src: Rect, dst: Rect) -> Self {
-        // Longer pulls take a little longer, but never enough to feel slow.
-        let ratio = if dst.w > 1.0 { src.w / dst.w } else { 1.0 };
-        let magnitude = ratio.abs().max(1.0).log2().clamp(0.0, 4.0);
-        Self {
-            src,
-            dst,
-            started: Instant::now(),
-            duration: Duration::from_millis(130 + (magnitude * 45.0) as u64),
-        }
-    }
-
-    /// Where a rectangle in the new layout was, before the switch.
-    fn origin_of(&self, rect: Rect) -> Rect {
-        let scale = if self.dst.w > 0.0 {
-            self.src.w / self.dst.w
-        } else {
-            1.0
-        };
-        Rect::new(
-            (rect.x - self.dst.x).mul_add(scale, self.src.x),
-            (rect.y - self.dst.y).mul_add(scale, self.src.y),
-            rect.w * scale,
-            rect.h * scale,
-        )
-    }
-
-    /// The rectangle to draw at this instant, and whether the transition is
-    /// still running.
-    fn sample(&self, rect: Rect) -> (Rect, bool) {
-        let elapsed =
-            self.started.elapsed().as_secs_f32() / self.duration.as_secs_f32();
-        if elapsed >= 1.0 {
-            return (rect, false);
-        }
-        let eased = 1.0 - (1.0 - elapsed).powi(3);
-        let from = self.origin_of(rect);
-        let lerp = |a: f32, b: f32| (b - a).mul_add(eased, a);
-        (
-            Rect::new(
-                lerp(from.x, rect.x),
-                lerp(from.y, rect.y),
-                lerp(from.w, rect.w),
-                lerp(from.h, rect.h),
-            ),
-            true,
-        )
-    }
-}
-
 /// Layout for one (crumbs, area, options) combination.
 struct LayoutCache {
     key: LayoutKey,
@@ -296,6 +345,9 @@ struct LayoutKey {
     options: LayoutOptions,
     /// Bumped whenever the applied filter changes.
     filter: u64,
+    skipping: usize,
+    chart: Chart,
+    metric: Metric,
 }
 
 /// Directories left behind and come back from, for `<` and `>`.
@@ -319,6 +371,26 @@ pub struct RunSummary {
     pub removed: u64,
     pub bytes: u64,
     pub failed: usize,
+    /// What the plan said would be freed.
+    pub planned: u64,
+    /// Files and directories the plan's targets hold, as scanned.
+    pub total_entries: u64,
+    pub progress: RemovalProgress,
+    pub started: Option<Instant>,
+}
+
+impl RunSummary {
+    /// How far along the run is, by entries where the plan knows them.
+    pub fn fraction(&self) -> f32 {
+        if self.total_entries > 0 {
+            return (self.progress.entries as f32 / self.total_entries as f32)
+                .min(1.0);
+        }
+        if self.total == 0 {
+            return 0.0;
+        }
+        (self.removed + self.failed as u64) as f32 / self.total as f32
+    }
 }
 
 /// Everything the app knows and everything it can do.
@@ -347,10 +419,21 @@ pub struct Disktree {
     /// arrow or Tab it is the keyboard selection again.
     pub pointer_active: bool,
     pub view: View,
-    /// The in-flight layout transition, if a level was just entered or left.
-    pub transition: Option<LayoutTransition>,
+    /// The level change in flight, if a level was just entered or left.
+    pub level_change: Option<LevelChange>,
+    /// The level as last drawn: what a level change starting now leaves.
+    last_level: Vec<Decorated>,
+    /// The system asks for as little motion as possible: a level change
+    /// lands at once.
+    pub reduce_motion: bool,
     pub layout_options: LayoutOptions,
     cache: Option<LayoutCache>,
+    pub chart: Chart,
+    /// The "+N more" tiles opened in the drawn directory, outermost first.
+    pub rest_pages: Vec<RestPage>,
+    gesture: Gesture,
+    /// The first click of a double click already opened what it hit.
+    first_click_opened: bool,
 
     /// Mouse position in treemap-local pixels, for hit-testing and the tooltip.
     pub pointer: Option<Point<Pixels>>,
@@ -359,6 +442,10 @@ pub struct Disktree {
     pub treemap_size: Rc<Cell<Size<Pixels>>>,
 
     pub marks: Marks,
+    /// What removing the marks would do, kept rather than derived where it
+    /// is shown: every refusal reads the filesystem. The removal judges each
+    /// item again regardless.
+    plan: Plan,
     pub removal_mode: RemovalMode,
     pub trash_backend: TrashBackend,
     /// The permanent-deletion alert dialog is open. Trash needs no dialog: it
@@ -383,6 +470,8 @@ pub struct Disktree {
     /// Free space before the removal, for the honest "what did it actually
     /// free" number rather than the sum of what was marked.
     pub space_baseline: Option<SpaceInfo>,
+    /// Space macOS can free on demand, which the Finder counts as free.
+    pub purgeable: Option<u64>,
     pub notice: Option<(String, Status)>,
 
     pub find: String,
@@ -406,16 +495,31 @@ pub struct Disktree {
     pub focus: FocusHandle,
     /// A trail crumb's sibling menu, when open.
     pub crumb_menu: Option<CrumbMenu>,
+    pub context_menu: Option<ContextMenu>,
+    /// A detail the disk section has open over the panel.
+    pub panel_detail: Option<PanelDetail>,
+    /// The side panel's scroll, for the chevron that says there is more.
+    pub panel_scroll: ScrollHandle,
+    /// What the menu bar was last built to show checked.
+    menus: Option<crate::app_menu::MenuState>,
+    pub theme: ThemeChoice,
+    /// Where settings are kept; `None` keeps them for this run only.
+    settings_path: Option<PathBuf>,
+    pub settings: Settings,
 
     pub color_mode: ColorMode,
     /// The largest things worth clearing, recomputed when a scan lands.
     pub insights: Vec<Candidate>,
+    /// Bumped per scan; only the newest findings are kept.
+    insights_epoch: u64,
     /// What git knows about each checkout that has been selected; `None`
     /// once asked and found not to be one.
     pub git: FxHashMap<PathBuf, Option<GitState>>,
     git_pending: FxHashSet<PathBuf>,
     /// The device the scanned volume is mounted from.
     pub device: Option<String>,
+    /// The name the Finder shows for it, on macOS.
+    pub volume_name: Option<String>,
     /// Whether macOS lets this process read everything: asked once, since a
     /// grant only takes effect after a relaunch. `None` off macOS.
     pub full_disk_access: Option<bool>,
@@ -429,6 +533,9 @@ pub struct Disktree {
     /// widening, when the old tree stays on screen until the wider one lands.
     pub scan_root: PathBuf,
     pub scan_elapsed: Option<Duration>,
+    /// No entry has been read for a while, though the walk goes on.
+    pub scan_stalled: bool,
+    last_progress: (u64, Instant),
     /// Unix seconds when the tree landed: the "now" ages are measured from.
     pub scanned_at: i64,
 }
@@ -443,6 +550,12 @@ impl Disktree {
         let home = std::env::home_dir();
         let space = space_info(&root_path).ok();
         let trash_backend = detect_trash_backend();
+        // Tests start from the defaults, whatever this machine keeps.
+        let settings_path = if cfg!(test) { None } else { Settings::path() };
+        let settings = settings_path
+            .as_deref()
+            .map(Settings::load)
+            .unwrap_or_default();
         let mut tree = Self {
             root_path,
             home,
@@ -460,16 +573,23 @@ impl Disktree {
             history_hover: None,
             pointer_active: false,
             view: View::default(),
-            transition: None,
+            level_change: None,
+            last_level: Vec::new(),
+            reduce_motion: !cfg!(test) && crate::appearance::reduces_motion(),
             layout_options: LayoutOptions {
                 max_depth: depth.clamp(1, 6),
                 ..LayoutOptions::default()
             },
             cache: None,
+            chart: settings.chart.unwrap_or_default(),
+            rest_pages: Vec::new(),
+            gesture: Gesture::default(),
+            first_click_opened: false,
             pointer: None,
             treemap_origin: Rc::new(Cell::new(Point::new(px(0.), px(0.)))),
             treemap_size: Rc::new(Cell::new(size(px(0.), px(0.)))),
             marks: Marks::default(),
+            plan: Plan::default(),
             // Reversible by default whenever this machine has a trash: the
             // permanent path stays one choice away, behind a dialog.
             removal_mode: if trash_backend.is_available() {
@@ -489,6 +609,7 @@ impl Disktree {
             run_log: Vec::new(),
             space,
             space_baseline: None,
+            purgeable: None,
             notice: None,
             find: String::new(),
             find_open: false,
@@ -503,20 +624,32 @@ impl Disktree {
             show_selection: true,
             focus: cx.focus_handle(),
             crumb_menu: None,
+            context_menu: None,
+            panel_detail: None,
+            panel_scroll: ScrollHandle::new(),
+            menus: None,
+            theme: settings.theme.unwrap_or_default(),
+            settings_path,
+            settings,
             color_mode: ColorMode::Kind,
             insights: Vec::new(),
+            insights_epoch: 0,
             git: FxHashMap::default(),
             git_pending: FxHashSet::default(),
             device: None,
+            volume_name: None,
             full_disk_access: None,
             disk_root: None,
             panel_rems: PANEL_REMS,
             scan_started: None,
             scan_root: PathBuf::new(),
             scan_elapsed: None,
+            scan_stalled: false,
+            last_progress: (0, Instant::now()),
             scanned_at: now_seconds(),
         };
         tree.device = device_for(&tree.root_path);
+        tree.volume_name = volume_name(&tree.root_path);
         tree.full_disk_access = tree
             .home
             .as_deref()
@@ -544,10 +677,11 @@ impl Disktree {
         cx: &mut Context<'_, Self>,
     ) -> Self {
         let mut app = Self::new(root_path, options, depth, cx);
-        app.marks.refresh(&app.root_path, &tree, app.options.metric);
+        app.marks.refresh(&app.root_path, &tree, Metric::Bytes);
         app.tree = Some(Arc::new(tree));
         app.cache = None;
-        app.refresh_insights();
+        app.replan();
+        app.refresh_insights(cx);
         app.select_largest(cx);
         app
     }
@@ -555,14 +689,25 @@ impl Disktree {
     /// Scan a different root from scratch. Marks are kept; a mark outside
     /// the new root is shown as kept back, never removed.
     pub fn set_root(&mut self, root: PathBuf, cx: &mut Context<'_, Self>) {
+        if self.screen == Screen::Running {
+            self.notice = Some((
+                "a removal is running; open another folder when it is done"
+                    .into(),
+                Status::Warning,
+            ));
+            cx.notify();
+            return;
+        }
         self.space = space_info(&root).ok();
         self.device = device_for(&root);
+        self.volume_name = volume_name(&root);
         // "Whole disk" means the disk of what is on screen, which a new root
         // can change: an external drive has its own.
         self.disk_root =
             volume_root_for(&root).or_else(|| self.disk_root.take());
         self.root_path = root;
         self.screen = Screen::Explore;
+        self.replan();
         self.start_scan(cx);
     }
 
@@ -586,8 +731,7 @@ impl Disktree {
         let epoch = self.scan_epoch;
         self.progress = ScanSnapshot::default();
         self.scan_error = None;
-        self.scan_started = Some(Instant::now());
-        self.scan_elapsed = None;
+        self.begin_scan_clock();
         self.scan_root.clone_from(&above);
         self.remember();
         let known = Known {
@@ -616,12 +760,36 @@ impl Disktree {
         }
     }
 
-    /// Recompute "worth a look" from the tree on screen.
-    fn refresh_insights(&mut self) {
+    /// Recompute "worth a look" from the tree on screen, off the UI thread: a
+    /// whole disk takes a noticeable fraction of a second. The old list goes
+    /// at once, since its crumbs could name other nodes in the new tree.
+    fn refresh_insights(&mut self, cx: &Context<'_, Self>) {
         self.scanned_at = now_seconds();
-        self.insights = self.tree.as_deref().map_or_else(Vec::new, |tree| {
-            worth_a_look(tree, self.scanned_at, INSIGHT_LIMIT)
-        });
+        self.insights.clear();
+        self.insights_epoch += 1;
+        let Some(tree) = self.tree.clone() else {
+            return;
+        };
+        let (epoch, now) = (self.insights_epoch, self.scanned_at);
+        let task = cx
+            .background_executor()
+            .spawn(async move { worth_a_look(&tree, now, INSIGHT_LIMIT) });
+        cx.spawn(async move |this, cx| {
+            let found = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if epoch == this.insights_epoch {
+                    this.insights = found;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Judge the marks again against the root on screen and the disk as it
+    /// is now.
+    pub fn replan(&mut self) {
+        self.plan = plan(self.marks.items(), &self.root_path);
     }
 
     /// Ask git about `path` once, off the UI thread, if it is a checkout.
@@ -676,16 +844,18 @@ impl Disktree {
             self.remember();
         }
         self.tree = None;
-        self.crumbs.clear();
+        self.set_crumbs(Vec::new());
         self.selected = None;
         self.hovered = None;
         self.view = View::default();
+        self.level_change = None;
         self.cache = None;
+        self.context_menu = None;
         self.insights.clear();
+        self.insights_epoch += 1;
         self.git.clear();
         self.clear_filter();
-        self.scan_started = Some(Instant::now());
-        self.scan_elapsed = None;
+        self.begin_scan_clock();
         self.scan_root.clone_from(&self.root_path);
         self.scan = Some(ScanHandle::spawn(
             self.root_path.clone(),
@@ -693,6 +863,13 @@ impl Disktree {
         ));
         Self::poll_scan(epoch, cx);
         cx.notify();
+    }
+
+    fn begin_scan_clock(&mut self) {
+        self.scan_started = Some(Instant::now());
+        self.scan_elapsed = None;
+        self.scan_stalled = false;
+        self.last_progress = (0, Instant::now());
     }
 
     fn poll_scan(epoch: u64, cx: &Context<'_, Self>) {
@@ -727,6 +904,12 @@ impl Disktree {
             return false;
         };
         self.progress = scan.progress.snapshot();
+        let entries = self.progress.files + self.progress.dirs;
+        if entries != self.last_progress.0 {
+            self.last_progress = (entries, Instant::now());
+        }
+        self.scan_stalled =
+            !self.progress.walked && self.last_progress.1.elapsed() > STALL;
         let Some(outcome) = scan.poll() else {
             cx.notify();
             return true;
@@ -742,19 +925,20 @@ impl Disktree {
                     self.root_path.clone_from(&self.scan_root);
                     self.space = space_info(&self.root_path).ok();
                     self.device = device_for(&self.root_path);
+                    self.volume_name = volume_name(&self.root_path);
                 }
-                let metric = self.options.metric;
-                self.marks.refresh(&self.root_path, &node, metric);
+                self.marks.refresh(&self.root_path, &node, Metric::Bytes);
                 self.tree = Some(Arc::new(node));
                 self.cache = None;
-                self.refresh_insights();
+                self.replan();
+                self.refresh_insights(cx);
                 self.scan_elapsed =
                     self.scan_started.map(|started| started.elapsed());
                 if let Some(from) = came_from {
                     let crumbs = self.crumbs_for_path(&from);
-                    self.crumbs.clear();
+                    self.set_crumbs(Vec::new());
                     self.view = View::default();
-                    self.transition = None;
+                    self.level_change = None;
                     self.forget_hover();
                     self.selected = crumbs.and_then(|crumbs| {
                         crumbs.first().map(|&top| vec![top])
@@ -767,17 +951,18 @@ impl Disktree {
             Err(error) => self.scan_error = Some(error.to_string()),
         }
         self.scan = None;
+        self.scan_stalled = false;
         self.progress.finished = true;
         cx.notify();
         false
     }
 
     fn keep_selection_valid(&mut self) {
-        let Some(tree) = &self.tree else {
+        let Some(tree) = self.tree.clone() else {
             return;
         };
         if tree.resolve(&self.crumbs).is_none() {
-            self.crumbs.clear();
+            self.set_crumbs(Vec::new());
         }
         if let Some(selected) = self.selected.clone()
             && tree.resolve(&selected).is_none()
@@ -787,9 +972,11 @@ impl Disktree {
     }
 
     /// Space changes under us all the time; poll it so the meter is live
-    /// without repainting when nothing moved.
+    /// without repainting when nothing moved. Purgeable space is asked far
+    /// less often: it costs the system more to answer.
     fn start_space_ticker(cx: &Context<'_, Self>) {
         cx.spawn(async move |this, cx| {
+            let mut ticks = 0_u32;
             loop {
                 let interval = this
                     .update(cx, |this, _| {
@@ -801,19 +988,30 @@ impl Disktree {
                     })
                     .unwrap_or(Duration::from_millis(1200));
                 cx.background_executor().timer(interval).await;
-                let ok = this
-                    .update(cx, |this, cx| {
-                        let path = this.root_path.clone();
-                        let fresh = space_info(&path).ok();
-                        if fresh != this.space {
-                            this.space = fresh;
+                let Ok(path) = this.update(cx, |this, cx| {
+                    let path = this.root_path.clone();
+                    let fresh = space_info(&path).ok();
+                    if fresh != this.space {
+                        this.space = fresh;
+                        cx.notify();
+                    }
+                    path
+                }) else {
+                    break;
+                };
+                if ticks.is_multiple_of(25) && cfg!(target_os = "macos") {
+                    let purgeable = cx
+                        .background_executor()
+                        .spawn(async move { purgeable_bytes(&path) })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        if purgeable != this.purgeable {
+                            this.purgeable = purgeable;
                             cx.notify();
                         }
-                    })
-                    .is_ok();
-                if !ok {
-                    break;
+                    });
                 }
+                ticks = ticks.wrapping_add(1);
             }
         })
         .detach();
@@ -847,9 +1045,9 @@ impl Disktree {
             .unwrap_or_else(|| self.root_path.clone())
     }
 
-    /// Breadcrumb labels from the scanned root to the current directory.
     /// The trail, from `/`: the directories above the scanned root, which
-    /// widen the scan, then the root and the path into the tree.
+    /// widen the scan, then the root, the path into the tree, and the "+N
+    /// more" pages opened in the directory drawn.
     pub fn breadcrumbs(&self) -> Vec<(String, Crumb)> {
         let mut trail: Vec<(String, Crumb)> = self
             .root_path
@@ -874,20 +1072,31 @@ impl Disktree {
             crumbs.push(index);
             trail.push((node.name.to_string(), Crumb::Tree(crumbs.clone())));
         }
+        for (page, rest) in self.rest_pages.iter().enumerate() {
+            trail.push((
+                format!(
+                    "+{} more",
+                    crate::widgets::human_count(rest.count as u64)
+                ),
+                Crumb::Rest(page + 1),
+            ));
+        }
         trail
     }
 
     /// The children of `parent`, largest first, for a sibling menu, and how
-    /// many more there are beyond [`SIBLING_ROWS`].
+    /// many more there are beyond [`SIBLING_ROWS`]. Children are already in
+    /// that order, so only the rows listed are read.
     pub fn siblings(&self, parent: &[usize]) -> (Vec<Sibling>, usize) {
         let metric = self.options.metric;
         let Some(node) = self.node_at(parent) else {
             return (Vec::new(), 0);
         };
-        let mut rows: Vec<Sibling> = node
+        let rows: Vec<Sibling> = node
             .children
             .iter()
             .enumerate()
+            .take(SIBLING_ROWS)
             .map(|(index, child)| Sibling {
                 index,
                 name: child.name.to_string(),
@@ -896,9 +1105,7 @@ impl Disktree {
                 is_dir: child.is_dir(),
             })
             .collect();
-        rows.sort_by_key(|row| std::cmp::Reverse(row.value));
-        let more = rows.len().saturating_sub(SIBLING_ROWS);
-        rows.truncate(SIBLING_ROWS);
+        let more = node.children.len() - rows.len();
         (rows, more)
     }
 
@@ -975,6 +1182,171 @@ impl Disktree {
         true
     }
 
+    /// Keys while a context menu is open: it owns the arrows, Enter and
+    /// Escape, and any other key closes it before acting.
+    fn on_context_key(
+        &mut self,
+        key: &str,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let rows = self.context_rows();
+        let last = rows.len().saturating_sub(1);
+        let Some(menu) = &mut self.context_menu else {
+            return false;
+        };
+        match key {
+            "down" | "j" => menu.highlighted = (menu.highlighted + 1).min(last),
+            "up" | "k" => menu.highlighted = menu.highlighted.saturating_sub(1),
+            "enter" | "space" => {
+                let index = menu.highlighted;
+                self.choose_context(index, cx);
+            }
+            "escape" => self.context_menu = None,
+            _ => {
+                self.context_menu = None;
+                cx.notify();
+                return false;
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// Open the right-click menu for the tile at `crumbs`, at `position` in
+    /// the window.
+    pub fn open_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        crumbs: Option<Vec<usize>>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.crumb_menu = None;
+        let Some(crumbs) = crumbs else {
+            self.context_menu = None;
+            cx.notify();
+            return;
+        };
+        let target = match self.rest_at(&crumbs) {
+            Some(rest) => self.path_at(&rest.parent).map(MenuTarget::Rest),
+            None => self.path_at(&crumbs).map(MenuTarget::Node),
+        };
+        let Some(target) = target else {
+            return;
+        };
+        self.selected = Some(crumbs);
+        self.pointer_active = false;
+        self.context_menu = Some(ContextMenu {
+            position,
+            target,
+            highlighted: 0,
+        });
+        cx.notify();
+    }
+
+    /// The rows of the open context menu, as the target stands now.
+    pub fn context_rows(&self) -> Vec<MenuRow> {
+        let Some(menu) = &self.context_menu else {
+            return Vec::new();
+        };
+        let row =
+            |label: String, action: MenuAction, separated: bool| MenuRow {
+                label,
+                action,
+                separated,
+            };
+        match &menu.target {
+            MenuTarget::Rest(folder) => vec![
+                row("Open".into(), MenuAction::OpenRest, false),
+                row(
+                    format!("{} {}", REVEAL, short_name(folder)),
+                    MenuAction::Reveal(folder.clone()),
+                    true,
+                ),
+            ],
+            MenuTarget::Node(path) => {
+                let node = self
+                    .crumbs_for_path(path)
+                    .and_then(|crumbs| self.node_at(&crumbs));
+                let mut rows = Vec::new();
+                if node.is_some_and(|node| {
+                    node.is_dir() && !node.children.is_empty()
+                }) {
+                    rows.push(row("Open".into(), MenuAction::Open, false));
+                }
+                let marked = self.marks.contains(path);
+                match self.marked_ancestor(path) {
+                    Some(ancestor) if !marked => rows.push(row(
+                        format!("Unmark {}", short_name(&ancestor)),
+                        MenuAction::Unmark(ancestor),
+                        false,
+                    )),
+                    _ if *path != self.root_path => rows.push(row(
+                        if marked { "Unmark" } else { "Mark for removal" }
+                            .into(),
+                        MenuAction::ToggleMark,
+                        false,
+                    )),
+                    _ => {}
+                }
+                rows.push(row(
+                    REVEAL.into(),
+                    MenuAction::Reveal(path.clone()),
+                    !rows.is_empty(),
+                ));
+                rows.push(row("Copy path".into(), MenuAction::CopyPath, false));
+                rows
+            }
+        }
+    }
+
+    /// Do what the context menu's row `index` says, by path: a scan may have
+    /// landed while it was open.
+    pub fn choose_context(&mut self, index: usize, cx: &mut Context<'_, Self>) {
+        let rows = self.context_rows();
+        let Some(menu) = self.context_menu.take() else {
+            return;
+        };
+        let Some(row) = rows.get(index) else {
+            cx.notify();
+            return;
+        };
+        let (MenuTarget::Node(path) | MenuTarget::Rest(path)) = &menu.target;
+        match &row.action {
+            MenuAction::Open => {
+                if let Some(crumbs) = self.crumbs_for_path(path) {
+                    self.selected = Some(crumbs);
+                    self.descend(cx);
+                }
+            }
+            MenuAction::OpenRest => {
+                if let Some(mut crumbs) = self.crumbs_for_path(path) {
+                    crumbs.push(REST);
+                    self.open_rest(&crumbs, cx);
+                }
+            }
+            MenuAction::ToggleMark => {
+                if let Some(crumbs) = self.crumbs_for_path(path) {
+                    self.toggle_mark(&crumbs, cx);
+                }
+            }
+            MenuAction::Unmark(ancestor) => self.unmark(ancestor, cx),
+            MenuAction::Reveal(target) => self.reveal_path(target, cx),
+            MenuAction::CopyPath => {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                    path.display().to_string(),
+                ));
+                self.notice = Some((
+                    format!(
+                        "copied {}",
+                        display_path(path, self.home.as_deref())
+                    ),
+                    Status::Success,
+                ));
+            }
+        }
+        cx.notify();
+    }
+
     const fn set_highlight(&mut self, row: usize) {
         if let Some(menu) = &mut self.crumb_menu {
             menu.highlighted = row;
@@ -984,6 +1356,12 @@ impl Disktree {
     /// Descend into the selected tile, or into the largest child of the
     /// current root when nothing is selected.
     pub fn descend(&mut self, cx: &mut Context<'_, Self>) {
+        if let Some(selected) = self.selected.clone()
+            && is_rest(&selected)
+        {
+            self.open_rest(&selected, cx);
+            return;
+        }
         let target = match self.selected.clone() {
             // Enter what is selected, however deep: a directory opens itself,
             // a file opens the directory holding it.
@@ -1004,113 +1382,101 @@ impl Disktree {
                 None => return,
             },
         };
-        let from = self.tile_body(&target).map(|rect| self.view.project(rect));
-        self.enter(target, from, cx);
+        self.enter(target, cx);
     }
 
-    /// Go inside one child of the current root, so that it fills the viewport.
-    ///
-    /// `from` is where the child was on screen, when the caller knows it.
     /// Make `target` — any directory below the current root — the root.
+    /// Returns whether the level changed.
     ///
-    /// `from` is where that directory's contents were on screen, so the
-    /// transition grows them from exactly there into the full viewport.
+    /// The level on screen flies into the directory's tile while the new one
+    /// grows out of it, so going in reads as one motion.
     fn enter(
         &mut self,
         target: Vec<usize>,
-        from: Option<Rect>,
         cx: &mut Context<'_, Self>,
-    ) {
+    ) -> bool {
         if target.len() <= self.crumbs.len()
             || !target.starts_with(&self.crumbs)
         {
-            return;
+            return false;
         }
         let Some(node) = self.node_at(&target) else {
-            return;
+            return false;
         };
         if !node.is_dir() || node.children.is_empty() {
-            return;
+            return false;
         }
+        let region = self.focus_region(&target, true);
+        let window = self.visible_window();
         self.remember();
         self.selected = Some(target.clone());
-        self.crumbs = target;
+        self.set_crumbs(target.clone());
         self.forget_hover();
         self.cache = None;
-        let area = self.treemap_size.get();
-        let src = from.unwrap_or_else(|| self.view.visible_base(area));
         self.view = View::IDENTITY;
-        let dst = Rect::new(
-            0.0,
-            0.0,
-            area.width.as_f32().max(1.0),
-            area.height.as_f32().max(1.0),
-        );
-        self.transition = Some(LayoutTransition::new(src, dst));
+        self.begin_level_change(target, region, true, Some(window), region);
         cx.notify();
+        true
     }
 
     /// Where a drawn directory's contents sit: its tile below the name band.
     /// This, not the whole tile, is the region its children occupy, so it is
-    /// what a transition into or out of it has to map.
+    /// what a level change into or out of it has to map.
     pub fn tile_body(&mut self, crumbs: &[usize]) -> Option<Rect> {
-        let tile =
-            self.layout()?.iter().find(|tile| tile.crumbs() == crumbs)?;
-        Some(match tile.header {
-            Some(header) => Rect::new(
-                tile.rect.x,
-                header.bottom(),
-                tile.rect.w,
-                tile.rect.bottom() - header.bottom(),
-            ),
-            None => tile.rect,
-        })
+        self.layout()?
+            .iter()
+            .find(|tile| tile.crumbs() == crumbs)
+            .map(Tile::body)
     }
 
-    /// The deepest drawn directory under a viewport point that has contents
-    /// to show: what zooming at that point is zooming into.
+    /// The directory one level down under a viewport point, with contents to
+    /// show: what zooming at that point goes into. One level at a time,
+    /// however many are drawn.
     fn zoom_target(&mut self, x: f32, y: f32) -> Option<Vec<usize>> {
         let hovered = self.tile_at(x, y)?;
-        let root = self.crumbs.len();
-        (root + 1..=hovered.len())
-            .rev()
-            .map(|length| hovered[..length].to_vec())
-            .find(|crumbs| {
-                self.node_at(crumbs).is_some_and(|node| {
-                    node.is_dir() && !node.children.is_empty()
-                }) && self.tile_body(crumbs).is_some()
-            })
+        if hovered.len() <= self.crumbs.len() {
+            return None;
+        }
+        let candidate = hovered[..=self.crumbs.len()].to_vec();
+        if is_rest(&candidate) {
+            return self.rest_at(&candidate).map(|_| candidate);
+        }
+        let enterable = self
+            .node_at(&candidate)
+            .is_some_and(|node| node.is_dir() && !node.children.is_empty());
+        (enterable && self.tile_body(&candidate).is_some()).then_some(candidate)
     }
 
-    /// Ascend to the parent directory, keeping the directory we came from in
-    /// view so the motion reads as zooming out.
-    pub fn ascend(&mut self, cx: &mut Context<'_, Self>) {
-        if let Some(parent_crumbs) = self.parent_crumbs() {
-            self.ascend_to(parent_crumbs, cx);
+    /// Ascend to the parent directory, or back out of a "+N more" page,
+    /// keeping where we came from in view so the motion reads as zooming
+    /// out. Returns whether the level changed.
+    pub fn ascend(&mut self, cx: &mut Context<'_, Self>) -> bool {
+        if !self.rest_pages.is_empty() {
+            return self.close_rest(cx);
         }
+        let Some(parent) = self.parent_crumbs() else {
+            return false;
+        };
+        self.ascend_to(parent, cx);
+        true
     }
 
     /// Make `ancestor`, a directory above the current root, the root.
     ///
     /// The directory we leave shrinks back into its tile when that tile is
-    /// drawn at the new level; from further up it is too small to track, and
-    /// the new level simply lands.
+    /// drawn at the new level, with the level around it closing in; from
+    /// further up it is too small to track, and the new level simply lands.
     fn ascend_to(&mut self, ancestor: Vec<usize>, cx: &mut Context<'_, Self>) {
         self.remember();
-        // The region we are looking at now, and where it sits in the layout
-        // we are going back to.
-        let area = self.treemap_size.get();
-        let child_crumbs = self.crumbs.clone();
-        let src = self.view.visible_base(area);
-        self.crumbs.clone_from(&ancestor);
+        let child = self.crumbs.clone();
+        self.set_crumbs(ancestor.clone());
         self.forget_hover();
         self.cache = None;
         self.selected = Some(ancestor);
         self.view = View::IDENTITY;
-        self.transition = self
-            .tile_body(&child_crumbs)
-            .filter(|rect| rect.w > 1.0 && rect.h > 1.0)
-            .map(|dst| LayoutTransition::new(src, dst));
+        let region = self.focus_region(&child, true);
+        let view = self.level_view();
+        self.begin_level_change(child, region, false, region, Some(view));
         cx.notify();
     }
 
@@ -1123,6 +1489,222 @@ impl Disktree {
         }
     }
 
+    /// Change the directory drawn. Its "+N more" pages belong to it, so they
+    /// go with it.
+    fn set_crumbs(&mut self, crumbs: Vec<usize>) {
+        self.crumbs = crumbs;
+        self.rest_pages.clear();
+    }
+
+    /// A level change is playing: the frame draws its camera instead of the
+    /// view, and a spun wheel should land on one level before taking the
+    /// next.
+    pub fn changing_level(&self) -> bool {
+        self.level_change
+            .as_ref()
+            .is_some_and(|change| change.transition.is_running(Instant::now()))
+    }
+
+    /// What a level fills when it is the one on screen, in the space the
+    /// chart lays out in.
+    fn level_view(&self) -> Rect {
+        if self.chart.is_partition() {
+            return Rect::new(
+                0.0,
+                0.0,
+                1.0,
+                self.layout_options.max_depth as f32,
+            );
+        }
+        let area = self.treemap_size.get();
+        Rect::new(
+            0.0,
+            0.0,
+            area.width.as_f32().max(1.0),
+            area.height.as_f32().max(1.0),
+        )
+    }
+
+    /// The part of the level on screen the viewport shows.
+    fn visible_window(&self) -> Rect {
+        if self.chart.is_partition() {
+            self.level_view()
+        } else {
+            self.view.visible_base(self.treemap_size.get())
+        }
+    }
+
+    /// What the inner level stands for in the level on screen: a treemap
+    /// directory's body, or a partition tile's span with the levels beneath
+    /// it, one deeper for a directory's children than for a tail's items.
+    fn focus_region(&mut self, target: &[usize], nested: bool) -> Option<Rect> {
+        let tile = self
+            .layout()?
+            .iter()
+            .find(|tile| tile.crumbs() == target)?
+            .clone();
+        if !self.chart.is_partition() {
+            return Some(tile.body());
+        }
+        Some(Rect::new(
+            tile.rect.x,
+            tile.rect.y + if nested { 1.0 } else { 0.0 },
+            tile.rect.w,
+            self.layout_options.max_depth as f32,
+        ))
+    }
+
+    /// Start a level change from the level as last drawn, unless the system
+    /// asks for less motion or there is nothing to move between.
+    fn begin_level_change(
+        &mut self,
+        focus: Vec<usize>,
+        region: Option<Rect>,
+        entering: bool,
+        from: Option<Rect>,
+        to: Option<Rect>,
+    ) {
+        self.level_change = match (region, from, to) {
+            (Some(region), Some(from), Some(to))
+                if region.w > 0.0 && region.h > 0.0 && !self.reduce_motion =>
+            {
+                Some(LevelChange {
+                    transition: LevelTransition::new(
+                        self.level_view(),
+                        region,
+                        from,
+                        to,
+                        entering,
+                        Instant::now(),
+                    ),
+                    outgoing: self.last_level.clone(),
+                    focus,
+                })
+            }
+            _ => None,
+        };
+    }
+
+    /// What the drawn "+N more" tile at `crumbs` stands for.
+    pub fn rest_at(&self, crumbs: &[usize]) -> Option<Rest> {
+        if !is_rest(crumbs) {
+            return None;
+        }
+        let tiles = self.cache.as_ref()?.tiles.as_slice();
+        let tile = tiles.iter().find(|tile| tile.crumbs() == crumbs)?;
+        match &tile.kind {
+            TileKind::Others {
+                crumbs,
+                count,
+                bytes,
+                files,
+            } => Some(Rest {
+                parent: crumbs[..crumbs.len() - 1].to_vec(),
+                count: *count,
+                bytes: *bytes,
+                files: *files,
+                rect: tile.rect,
+            }),
+            TileKind::Node { .. } => None,
+        }
+    }
+
+    /// The children a "+N more" tile stands for, laid out on their own.
+    ///
+    /// A tail inside a directory drawn at depth opens that directory, which
+    /// then has room for more of its children; the drawn directory's own tail
+    /// becomes a page of its smaller items, where each can be marked.
+    /// Returns whether the level changed.
+    pub fn open_rest(
+        &mut self,
+        target: &[usize],
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let _ = self.layout();
+        let Some(rest) = self.rest_at(target) else {
+            return false;
+        };
+        self.notice = None;
+        if rest.parent != self.crumbs {
+            return self.enter(rest.parent, cx);
+        }
+        let skipped = self.cache.as_ref().map_or(0, |cache| {
+            cache
+                .tiles
+                .iter()
+                .filter(|tile| tile.depth == 0 && !is_rest(tile.crumbs()))
+                .count()
+        });
+        if skipped == 0 {
+            self.notice = Some((
+                format!(
+                    "these {} items are too small to draw even on their own",
+                    crate::widgets::human_count(rest.count as u64)
+                ),
+                Status::Warning,
+            ));
+            cx.notify();
+            return false;
+        }
+        let region = self.focus_region(target, false);
+        let window = self.visible_window();
+        self.rest_pages.push(RestPage {
+            skipped,
+            count: rest.count,
+        });
+        self.selected = Some(self.crumbs.clone());
+        self.forget_hover();
+        self.cache = None;
+        self.view = View::IDENTITY;
+        self.begin_level_change(
+            target.to_vec(),
+            region,
+            true,
+            Some(window),
+            region,
+        );
+        cx.notify();
+        true
+    }
+
+    /// Back out of the last "+N more" page, onto the tile it opened.
+    fn close_rest(&mut self, cx: &mut Context<'_, Self>) -> bool {
+        self.rest_pages.pop();
+        let mut tail = self.crumbs.clone();
+        tail.push(REST);
+        self.selected = Some(tail.clone());
+        self.forget_hover();
+        self.cache = None;
+        self.view = View::IDENTITY;
+        let region = self.focus_region(&tail, false);
+        let view = self.level_view();
+        self.begin_level_change(tail, region, false, region, Some(view));
+        cx.notify();
+        true
+    }
+
+    /// Go back to `pages` "+N more" pages in, from the trail.
+    pub fn show_rest_pages(
+        &mut self,
+        pages: usize,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if pages >= self.rest_pages.len() {
+            return;
+        }
+        self.rest_pages.truncate(pages);
+        self.selected = Some(self.crumbs.clone());
+        self.forget_hover();
+        self.view = View::IDENTITY;
+        self.level_change = None;
+        self.cache = None;
+        cx.notify();
+    }
+
+    fn rest_skipped(&self) -> usize {
+        self.rest_pages.iter().map(|page| page.skipped).sum()
+    }
+
     /// Jump straight to a crumb from the breadcrumb bar.
     ///
     /// A jump can skip several levels, so there is no single region to move:
@@ -1133,11 +1715,11 @@ impl Disktree {
         if crumbs != self.crumbs {
             self.remember();
         }
-        self.crumbs.clone_from(&crumbs);
+        self.set_crumbs(crumbs.clone());
         self.selected = Some(crumbs);
         self.forget_hover();
         self.view = View::IDENTITY;
-        self.transition = None;
+        self.level_change = None;
         self.cache = None;
         cx.notify();
     }
@@ -1241,9 +1823,7 @@ impl Disktree {
             && target.starts_with(&self.crumbs)
             && enterable
         {
-            let from =
-                self.tile_body(&target).map(|rect| self.view.project(rect));
-            self.enter(target, from, cx);
+            self.enter(target, cx);
         } else if target.len() < self.crumbs.len()
             && self.crumbs.starts_with(&target)
         {
@@ -1301,14 +1881,24 @@ impl Disktree {
         self.pointer_active = false;
     }
 
+    /// Move the selection geometrically among tiles at the same depth, on
+    /// screen as drawn, falling back to the parent at an edge.
     pub fn move_selection(
         &mut self,
         direction: Direction,
         cx: &mut Context<'_, Self>,
     ) {
         self.pointer_active = false;
-        let area = self.treemap_size.get();
-        let _ = area;
+        let geometry = self.chart_geometry();
+        let view = self.view;
+        let partition = self.chart.is_partition();
+        let on_screen = |rect: Rect| {
+            if partition {
+                geometry.flat(rect)
+            } else {
+                view.project(rect)
+            }
+        };
         let Some(tiles) = self.layout().map(<[Tile]>::to_vec) else {
             return;
         };
@@ -1322,7 +1912,7 @@ impl Disktree {
         let Some(from) = tiles
             .iter()
             .find(|tile| tile.crumbs() == current.as_slice())
-            .map(|tile| self.view.project(tile.rect))
+            .map(|tile| on_screen(tile.rect))
         else {
             return;
         };
@@ -1336,7 +1926,7 @@ impl Disktree {
             if crumbs.len() != depth || crumbs == current.as_slice() {
                 continue;
             }
-            let rect = self.view.project(tile.rect);
+            let rect = on_screen(tile.rect);
             let Some(gap) = direction.gap(&from, &rect) else {
                 continue;
             };
@@ -1350,9 +1940,9 @@ impl Disktree {
         if let Some((_, crumbs)) = best {
             self.select(Some(crumbs), cx);
         } else if direction.is_backwards()
-            && let Some(parent) = self.parent_crumbs()
+            && current.len() > self.crumbs.len() + 1
         {
-            self.select(Some(parent), cx);
+            self.select(Some(current[..current.len() - 1].to_vec()), cx);
         }
     }
 
@@ -1425,12 +2015,30 @@ impl Disktree {
     /// A mark covers everything beneath it, since removing a directory takes
     /// its contents with it: marking a directory absorbs the marks already
     /// inside it, and a path inside a marked directory cannot be marked or
-    /// kept on its own — it says which mark it goes with instead.
+    /// kept on its own — it says which mark it goes with instead. A "+N
+    /// more" tile is many items nobody has looked at, so it is opened to be
+    /// marked, never marked whole.
     pub fn toggle_mark(
         &mut self,
         crumbs: &[usize],
         cx: &mut Context<'_, Self>,
     ) {
+        if let Some(rest) = self.rest_at(crumbs) {
+            let folder = self.path_at(&rest.parent).map_or_else(
+                || "this directory".to_string(),
+                |path| display_path(&path, self.home.as_deref()),
+            );
+            let count = crate::widgets::human_count(rest.count as u64);
+            self.notice = Some((
+                format!(
+                    "\u{201c}+{count} more\u{201d} is {count} smaller items in \
+                     {folder}; open it to mark them one by one"
+                ),
+                Status::Warning,
+            ));
+            cx.notify();
+            return;
+        }
         let Some(target) = self.target_at(crumbs) else {
             return;
         };
@@ -1476,6 +2084,7 @@ impl Disktree {
                 ));
             }
         }
+        self.replan();
         cx.notify();
     }
 
@@ -1489,32 +2098,37 @@ impl Disktree {
             .min_by_key(|ancestor| ancestor.as_os_str().len())
     }
 
+    /// Always bytes, whatever the metric on screen: it is space that comes
+    /// back.
     pub fn target_at(&self, crumbs: &[usize]) -> Option<Target> {
         let node = self.node_at(crumbs)?;
         let path = self.path_at(crumbs)?;
         Some(Target {
             hidden: is_hidden(&path),
             path,
-            bytes: node.value(self.options.metric),
+            bytes: node.bytes,
             is_dir: node.is_dir(),
-            entries: node.files + node.dirs,
+            // A link is neither a file nor a directory, but it is one entry.
+            entries: (node.files + node.dirs).max(1),
         })
     }
 
     pub fn unmark(&mut self, path: &Path, cx: &mut Context<'_, Self>) {
         self.marks.remove(path);
+        self.replan();
         cx.notify();
     }
 
     pub fn clear_marks(&mut self, cx: &mut Context<'_, Self>) {
         self.marks.clear();
+        self.replan();
         self.notice = None;
         cx.notify();
     }
 
     /// The plan the review screen shows and the removal runs.
-    pub fn plan(&self) -> Plan {
-        plan(self.marks.items(), &self.root_path)
+    pub const fn plan(&self) -> &Plan {
+        &self.plan
     }
 
     // ── layout and hit-testing ──────────────────────────────────────────
@@ -1523,126 +2137,347 @@ impl Disktree {
     ///
     /// Runs once per render, before the paint callbacks: painting then only has
     /// to draw, and the marked/hidden/selected state of every tile is decided
-    /// here, where the tree and the marks are both at hand.
+    /// here, where the tree and the marks are both at hand. During a level
+    /// change both levels are placed, each through the camera.
     pub fn prepare(&mut self) -> Mosaic {
-        let metric = self.options.metric;
-        let view = self.view;
-        let hovered = self.hovered.clone();
-        let selected = self.selected.clone();
-
-        // Marks are paths; the mosaic thinks in crumbs. Resolve once per frame
-        // rather than building a path for every tile.
-        let mut marked: FxHashSet<Vec<usize>> = FxHashSet::default();
-        for item in self.marks.items() {
-            if let Some(crumbs) = self.crumbs_for_path(&item.path) {
-                marked.insert(crumbs);
-            }
-        }
-
-        let Some(tiles) = self.layout().map(<[Tile]>::to_vec) else {
+        let geometry = self.chart_geometry();
+        if self.layout().is_none() {
             return Mosaic {
-                view,
+                view: self.view,
                 ..Mosaic::default()
             };
-        };
-
-        // Hue comes from the node's kind; lightness from its depth in this
-        // view, so the first level always reads as the first level.
-        let age = self.color_mode == ColorMode::Age;
-        let now = self.scanned_at;
-        let mut decorations = Vec::with_capacity(tiles.len());
-        let mut labels = Vec::new();
-        for tile in &tiles {
-            let crumbs = tile.crumbs();
-            let node = match &tile.kind {
-                TileKind::Node { crumbs } => self.node_at(crumbs),
-                TileKind::Others { .. } => None,
-            };
-            let category = node.map_or_else(Default::default, |n| n.category);
-            let age_bucket = (age && node.is_some_and(|n| n.modified > 0))
-                .then(|| {
-                    let days =
-                        (now - node.map_or(now, |n| n.modified)) / 86_400;
-                    crate::palette::age_bucket(days)
-                });
-            let filtered = match self.matches.as_deref().map(|m| m.keep(crumbs))
-            {
-                None | Some(Some(Keep::Whole)) => Filtered::Shown,
-                Some(Some(Keep::Partial { .. })) => Filtered::Holds,
-                Some(None) => Filtered::Out,
-            };
-            let is_marked = marked.contains(crumbs);
-            // Everything inside a marked directory goes with it, so it is
-            // drawn marked too.
-            let is_covered = !marked.is_empty()
-                && (1..crumbs.len())
-                    .any(|length| marked.contains(&crumbs[..length]));
-            decorations.push(TileDeco {
-                rect: self.animated_rect(tile.rect),
-                depth: tile.depth,
-                category,
-                age_bucket,
-                reclaimable: node.is_some_and(|n| n.reclaim.is_some()),
-                filtered,
-                unreadable: node.is_some_and(|n| n.read_error),
-                marked: is_marked,
-                covered: is_covered,
-                hovered: hovered.as_deref() == Some(crumbs),
-                selected: selected.as_deref() == Some(crumbs),
-            });
-
-            // Labels are chosen in screen space: zooming in makes room for more
-            // of them, which is the point of zooming in.
-            let drawn = self.animated_rect(tile.rect);
-            let screen = view.project(
-                tile.header
-                    .map_or(drawn, |header| self.animated_rect(header)),
-            );
-            if screen.w < LABEL_MIN_W_REMS * self.rem
-                || screen.h < LABEL_MIN_H_REMS * self.rem
-            {
-                continue;
-            }
-            match &tile.kind {
-                TileKind::Node { crumbs } => {
-                    let Some(node) = self.node_at(crumbs) else {
-                        continue;
-                    };
-                    labels.push(Label {
-                        text: node.name.to_string(),
-                        rect: self.animated_rect(tile.rect),
-                        header: tile
-                            .header
-                            .map(|header| self.animated_rect(header)),
-                        depth: tile.depth,
-                        dim: filtered == Filtered::Out,
-                        marked: is_marked || is_covered,
-                        size_text: crate::widgets::short_value(node, metric),
-                    });
-                }
-                TileKind::Others { count, .. } => labels.push(Label {
-                    text: format!("+{count} more"),
-                    rect: self.animated_rect(tile.rect),
-                    header: None,
-                    depth: tile.depth,
-                    dim: self.matches.is_some(),
-                    marked: false,
-                    size_text: String::new(),
-                }),
-            }
         }
+        let now = Instant::now();
+        if self
+            .level_change
+            .as_ref()
+            .is_some_and(|change| !change.transition.is_running(now))
+        {
+            self.level_change = None;
+        }
+        let level = self.decorate();
+        let animating = self.level_change.is_some();
+        let view = if self.chart.is_partition() || animating {
+            View::IDENTITY
+        } else {
+            self.view
+        };
+        let mut mosaic = Mosaic {
+            tiles: Vec::with_capacity(level.len()),
+            labels: Vec::new(),
+            view,
+            chart: self.chart,
+            geometry: self.chart.is_partition().then_some(geometry),
+            center: None,
+        };
+        self.add_folder(&geometry, &mut mosaic);
+        let change = self.level_change.take();
+        if let Some(change) = &change {
+            let progress = change.transition.progress(now);
+            let focus = change.focus.as_slice();
+            let inside = |item: &&Decorated| {
+                item.crumbs.len() > focus.len()
+                    && item.crumbs.starts_with(focus)
+            };
+            let outer = |rect| change.transition.outer(rect, progress);
+            let inner = |rect| change.transition.inner(rect, progress);
+            if change.transition.entering {
+                let leaving =
+                    change.outgoing.iter().filter(|item| !inside(item));
+                self.place(leaving, &geometry, &mut mosaic, outer);
+                self.place(level.iter(), &geometry, &mut mosaic, inner);
+            } else {
+                let around = level.iter().filter(|item| !inside(item));
+                self.place(around, &geometry, &mut mosaic, outer);
+                self.place(
+                    change.outgoing.iter(),
+                    &geometry,
+                    &mut mosaic,
+                    inner,
+                );
+            }
+        } else {
+            self.place(level.iter(), &geometry, &mut mosaic, |rect| rect);
+        }
+        self.level_change = change;
+        self.last_level = level;
 
-        labels.sort_by(|left, right| {
+        mosaic.labels.sort_by(|left, right| {
             let left_area = left.rect.w * left.rect.h;
             let right_area = right.rect.w * right.rect.h;
             right_area.total_cmp(&left_area)
         });
-        labels.truncate(MAX_LABELS);
+        mosaic.labels.truncate(MAX_LABELS);
+        mosaic
+    }
 
-        Mosaic {
-            tiles: decorations,
-            labels,
-            view,
+    /// Every tile of the level on screen, decorated, in layout space.
+    fn decorate(&self) -> Vec<Decorated> {
+        let Some(tiles) =
+            self.cache.as_ref().map(|cache| cache.tiles.as_slice())
+        else {
+            return Vec::new();
+        };
+        // Marks are paths; the mosaic thinks in crumbs. Resolve once per frame
+        // rather than building a path for every tile.
+        let marked: FxHashSet<Vec<usize>> = self
+            .marks
+            .items()
+            .iter()
+            .filter_map(|item| self.crumbs_for_path(&item.path))
+            .collect();
+        let hovered = self.hovered.as_deref();
+        let selected = self.selected.as_deref();
+        // Hue comes from the node's kind; lightness from its depth in this
+        // view, so the first level always reads as the first level.
+        let age = self.color_mode == ColorMode::Age;
+        let now = self.scanned_at;
+        tiles
+            .iter()
+            .map(|tile| {
+                let crumbs = tile.crumbs();
+                let (node, rest) = match &tile.kind {
+                    TileKind::Node { crumbs } => (self.node_at(crumbs), None),
+                    TileKind::Others {
+                        count,
+                        bytes,
+                        files,
+                        ..
+                    } => (None, Some((*count, *bytes, *files))),
+                };
+                let age_bucket = (age && node.is_some_and(|n| n.modified > 0))
+                    .then(|| {
+                        let days =
+                            (now - node.map_or(now, |n| n.modified)) / 86_400;
+                        crate::palette::age_bucket(days)
+                    });
+                // A tail holds what matched in its directory, as far as a
+                // frame can tell.
+                let kept = if is_rest(crumbs) {
+                    &crumbs[..crumbs.len() - 1]
+                } else {
+                    crumbs
+                };
+                let filtered =
+                    match self.matches.as_deref().map(|m| m.keep(kept)) {
+                        None | Some(Some(Keep::Whole)) => Filtered::Shown,
+                        Some(Some(Keep::Partial { .. })) => Filtered::Holds,
+                        Some(None) => Filtered::Out,
+                    };
+                // Everything inside a marked directory goes with it, so it is
+                // drawn marked too.
+                let covered = !marked.is_empty()
+                    && (1..crumbs.len())
+                        .any(|length| marked.contains(&crumbs[..length]));
+                Decorated {
+                    crumbs: crumbs.to_vec(),
+                    tile: TileDeco {
+                        rect: tile.rect,
+                        depth: tile.depth,
+                        category: node
+                            .map_or_else(Default::default, |n| n.category),
+                        age_bucket,
+                        reclaimable: node.is_some_and(|n| n.reclaim.is_some()),
+                        filtered,
+                        unreadable: node.is_some_and(|n| n.read_error),
+                        marked: marked.contains(crumbs),
+                        covered,
+                        hovered: hovered == Some(crumbs),
+                        selected: selected == Some(crumbs),
+                    },
+                    header: tile.header,
+                    rest,
+                }
+            })
+            .collect()
+    }
+
+    /// Put decorated tiles on screen through `map`, with a label for each
+    /// one that has room to be read.
+    fn place<'a>(
+        &self,
+        items: impl Iterator<Item = &'a Decorated>,
+        geometry: &ChartGeometry,
+        mosaic: &mut Mosaic,
+        map: impl Fn(Rect) -> Rect,
+    ) {
+        let rem = self.rem;
+        let rings = Rect::new(0.0, 0.0, 1.0, geometry.levels as f32);
+        let area = self.treemap_size.get();
+        let screen =
+            Rect::new(0.0, 0.0, area.width.as_f32(), area.height.as_f32());
+        let metric = self.options.metric;
+        for item in items {
+            let mapped = map(item.tile.rect);
+            let header = item.header.map(&map);
+            let rect = match self.chart {
+                Chart::Treemap => mapped,
+                Chart::Sunburst => match clipped(mapped, rings) {
+                    Some(rect) => rect,
+                    None => continue,
+                },
+                Chart::Icicle => {
+                    match clipped(geometry.flat(mapped), geometry.columns()) {
+                        Some(rect) => rect.inset(1.0),
+                        None => continue,
+                    }
+                }
+            };
+            let mut tile = item.tile.clone();
+            tile.rect = rect;
+            let (dim, marked, depth) = (
+                tile.filtered == Filtered::Out,
+                tile.marked || tile.covered,
+                tile.depth,
+            );
+            mosaic.tiles.push(tile);
+
+            // Labels are chosen in screen space: zooming in makes room for
+            // more of them, which is the point of zooming in. Culled here as
+            // well as when painting, so the label cap is spent on what is on
+            // screen.
+            let room = if self.chart == Chart::Sunburst {
+                let radius = geometry
+                    .ring()
+                    .mul_add(rect.y + rect.h / 2.0, geometry.hole());
+                let along = rect.w * std::f32::consts::TAU * radius;
+                let across = geometry.ring() * rect.h;
+                along.max(across) >= LABEL_MIN_W_REMS * rem
+                    && along.min(across) >= LABEL_MIN_H_REMS * rem
+            } else {
+                let owned = mosaic.view.project(header.unwrap_or(rect));
+                let line = if self.chart == Chart::Icicle {
+                    LABEL_LINE_REMS
+                } else {
+                    LABEL_MIN_H_REMS
+                };
+                owned.w >= LABEL_MIN_W_REMS * rem
+                    && owned.h >= line * rem
+                    && clipped(owned, screen).is_some()
+            };
+            if !room {
+                continue;
+            }
+            let (text, size_text) =
+                if let Some((count, bytes, files)) = item.rest {
+                    (
+                        format!(
+                            "+{} more",
+                            crate::widgets::human_count(count as u64)
+                        ),
+                        match metric {
+                            Metric::Bytes => {
+                                disktree_core::size::human_bytes_short(bytes)
+                            }
+                            Metric::Files => crate::widgets::human_count(files),
+                        },
+                    )
+                } else {
+                    let Some(node) = self.node_at(&item.crumbs) else {
+                        continue;
+                    };
+                    (
+                        node.name.to_string(),
+                        crate::widgets::short_value(node, metric),
+                    )
+                };
+            mosaic.labels.push(Label {
+                text,
+                rect,
+                header,
+                depth,
+                dim,
+                marked,
+                size_text,
+            });
+        }
+    }
+
+    /// The directory a partition chart is drawn from: named in the
+    /// sunburst's hole, and the icicle's first column.
+    fn add_folder(&self, geometry: &ChartGeometry, mosaic: &mut Mosaic) {
+        let Some(folder) = self.current() else {
+            return;
+        };
+        let name = if self.crumbs.is_empty() {
+            crumb_label(&self.root_path)
+        } else {
+            folder.name.to_string()
+        };
+        let hovering =
+            self.pointer_active && self.hovered.as_ref() == Some(&self.crumbs);
+        let metric = self.options.metric;
+        match self.chart {
+            Chart::Treemap => {}
+            Chart::Sunburst => {
+                mosaic.center = Some(CenterLabel {
+                    name,
+                    size_text: match metric {
+                        Metric::Bytes => {
+                            disktree_core::size::human_bytes(folder.bytes)
+                        }
+                        Metric::Files => format!(
+                            "{} files",
+                            crate::widgets::human_count(folder.files)
+                        ),
+                    },
+                    hovered: hovering,
+                    // Nothing above the scanned root to go up to.
+                    can_ascend: !self.crumbs.is_empty()
+                        || !self.rest_pages.is_empty(),
+                });
+            }
+            Chart::Icicle => {
+                let rect =
+                    Rect::new(0.0, 0.0, geometry.root_width, geometry.height)
+                        .inset(1.0);
+                if rect.w <= 0.0 {
+                    return;
+                }
+                mosaic.tiles.push(TileDeco {
+                    rect,
+                    depth: 0,
+                    category: folder.category,
+                    age_bucket: None,
+                    reclaimable: false,
+                    filtered: Filtered::Shown,
+                    unreadable: false,
+                    marked: false,
+                    covered: false,
+                    hovered: hovering,
+                    selected: self.selected.as_ref() == Some(&self.crumbs),
+                });
+                mosaic.labels.push(Label {
+                    text: if self.crumbs.is_empty() {
+                        name
+                    } else {
+                        format!("\u{2039} {name}")
+                    },
+                    rect,
+                    header: None,
+                    depth: 0,
+                    dim: false,
+                    marked: false,
+                    size_text: crate::widgets::short_value(folder, metric),
+                });
+            }
+        }
+    }
+
+    /// Where the partition charts' unit space lands in the viewport.
+    pub fn chart_geometry(&self) -> ChartGeometry {
+        let area = self.treemap_size.get();
+        let width = area.width.as_f32().round();
+        ChartGeometry {
+            chart: self.chart,
+            width,
+            height: area.height.as_f32().round(),
+            levels: self.layout_options.max_depth,
+            root_width: if self.chart == Chart::Icicle {
+                (FOLDER_COLUMN_REMS * self.rem).min(width * 0.2)
+            } else {
+                0.0
+            },
         }
     }
 
@@ -1670,7 +2505,8 @@ impl Disktree {
         Some(crumbs)
     }
 
-    /// Tiles for the current root and viewport size, computed once per change.
+    /// Tiles for the current root, chart and viewport size, computed once
+    /// per change.
     pub fn layout(&mut self) -> Option<&[Tile]> {
         // A 17 px band at the default rem, scaled so zoom keeps the band's
         // relationship to the label inside it.
@@ -1692,6 +2528,9 @@ impl Disktree {
             height: area.height.as_f32().round(),
             options: self.layout_options.clone(),
             filter: self.filter_epoch,
+            skipping: self.rest_skipped(),
+            chart: self.chart,
+            metric: self.options.metric,
         };
         if key.width < 1.0 || key.height < 1.0 {
             return None;
@@ -1700,17 +2539,34 @@ impl Disktree {
         if stale {
             let tree = self.tree.clone()?;
             let node = tree.resolve(&self.crumbs)?;
-            let rect = Rect::new(0.0, 0.0, key.width, key.height);
             let filter =
                 self.matches.as_deref().filter(|_| self.filter_applied);
-            let tiles = layout_filtered(
-                node,
-                &key.crumbs,
-                rect,
-                self.options.metric,
-                &key.options,
-                filter,
-            );
+            let tiles = if self.chart.is_partition() {
+                let geometry = self.chart_geometry();
+                let min_tile = key.options.min_tile;
+                partition(
+                    node,
+                    &key.crumbs,
+                    Partition {
+                        metric: key.metric,
+                        max_depth: key.options.max_depth,
+                        max_children: key.options.max_children,
+                    },
+                    |depth| geometry.min_span(depth, min_tile),
+                    filter,
+                    key.skipping,
+                )
+            } else {
+                layout_filtered(
+                    node,
+                    &key.crumbs,
+                    Rect::new(0.0, 0.0, key.width, key.height),
+                    key.metric,
+                    &key.options,
+                    filter,
+                    key.skipping,
+                )
+            };
             self.cache = Some(LayoutCache { key, tiles });
         }
         self.cache.as_ref().map(|cache| cache.tiles.as_slice())
@@ -1725,23 +2581,34 @@ impl Disktree {
             .map(|tile| tile.rect)
     }
 
-    /// The deepest tile under a viewport point.
+    /// The deepest tile under a viewport point. A sunburst's hole and an
+    /// icicle's first column stand for the directory they are drawn from.
     pub fn tile_at(&mut self, x: f32, y: f32) -> Option<Vec<usize>> {
-        let (base_x, base_y) = self.view.unproject(x, y);
+        let (base_x, base_y) = if self.chart.is_partition() {
+            match self.chart_geometry().locate(x, y) {
+                Location::Hole => return Some(self.crumbs.clone()),
+                Location::Outside => return None,
+                Location::Unit { x, y } => (x, y),
+            }
+        } else {
+            self.view.unproject(x, y)
+        };
         let tiles = self.layout()?;
         hit(tiles, base_x, base_y).map(|tile| tile.crumbs().to_vec())
     }
 
     // ── view ────────────────────────────────────────────────────────────
 
-    /// Zoom toward a point.
+    /// Zoom toward a point. Returns whether the level changed.
     ///
     /// When `descend` is set the wheel stops magnifying at the point where the
     /// directory under the pointer exactly fits the viewport, and the next
     /// notch goes inside it. That ceiling is what keeps the two gestures
     /// continuous: at the moment the level changes, the tiles inside the
     /// directory are already as large as they will be, so entering makes them
-    /// grow rather than shrink.
+    /// grow rather than shrink. A partition chart has no magnified view: the
+    /// wheel only goes in or back out. Nothing zooms while a level change
+    /// plays.
     pub fn zoom_at(
         &mut self,
         x: f32,
@@ -1749,20 +2616,23 @@ impl Disktree {
         factor: f32,
         descend: bool,
         cx: &mut Context<'_, Self>,
-    ) {
+    ) -> bool {
+        if self.changing_level() {
+            return false;
+        }
+        if self.chart.is_partition() {
+            return descend && self.change_level(x, y, factor > 1.0, cx);
+        }
         let area = self.treemap_size.get();
 
         // At the bottom of the zoom, zooming out goes up a level.
         if factor < 1.0 && self.view.scale <= View::MIN_SCALE + f32::EPSILON {
-            if descend {
-                self.ascend(cx);
-            }
-            return;
+            return descend && self.ascend(cx);
         }
 
         // One directory decides both how far the wheel magnifies and where it
-        // then goes: the deepest one under the pointer. At the ceiling its
-        // contents fill the view, so going inside continues the same motion.
+        // then goes. At the ceiling its contents fill the view, so going
+        // inside continues the same motion.
         let target = if descend {
             self.zoom_target(x, y)
         } else {
@@ -1777,13 +2647,38 @@ impl Disktree {
             && self.view.scale >= ceiling - f32::EPSILON
             && let Some(target) = target
         {
-            let from = body.map(|rect| self.view.project(rect));
-            self.enter(target, from, cx);
-            return;
+            return if is_rest(&target) {
+                self.open_rest(&target, cx)
+            } else {
+                self.enter(target, cx)
+            };
         }
 
         self.view = self.view.zoomed_at(x, y, factor, ceiling).clamped(area);
         cx.notify();
+        false
+    }
+
+    /// A partition chart's wheel: into the directory under the pointer, or
+    /// back out.
+    fn change_level(
+        &mut self,
+        x: f32,
+        y: f32,
+        inward: bool,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        if !inward {
+            return self.ascend(cx);
+        }
+        let Some(target) = self.zoom_target(x, y) else {
+            return false;
+        };
+        if is_rest(&target) {
+            self.open_rest(&target, cx)
+        } else {
+            self.enter(target, cx)
+        }
     }
 
     pub fn reset_view(&mut self, cx: &mut Context<'_, Self>) {
@@ -1801,22 +2696,30 @@ impl Disktree {
         cx.notify();
     }
 
+    /// Rank by the other metric. Children are ordered by it, so every crumb
+    /// moves; the directory on screen and the selection are found again by
+    /// path.
     pub fn toggle_metric(&mut self, cx: &mut Context<'_, Self>) {
+        let here = self.current_path();
+        let selected = self
+            .selected
+            .as_ref()
+            .filter(|crumbs| !is_rest(crumbs))
+            .and_then(|crumbs| self.path_at(crumbs));
         self.options.metric = self.options.metric.toggled();
         if let Some(tree) = &self.tree {
             let mut tree = (**tree).clone();
             disktree_core::tree::aggregate(&mut tree, self.options.metric);
             self.tree = Some(Arc::new(tree));
-            let metric = self.options.metric;
-            self.marks.refresh(
-                &self.root_path,
-                self.tree.as_ref().unwrap(),
-                metric,
-            );
         }
-        // Children are ordered by the metric, so every crumb moved.
-        self.refresh_insights();
+        let crumbs = self.crumbs_for_path(&here).unwrap_or_default();
+        self.set_crumbs(crumbs);
+        self.selected = selected.and_then(|path| self.crumbs_for_path(&path));
+        self.refresh_insights(cx);
         self.clear_filter();
+        self.forget_hover();
+        self.view = View::IDENTITY;
+        self.level_change = None;
         self.cache = None;
         cx.notify();
     }
@@ -1903,25 +2806,101 @@ impl Disktree {
         if !(keystroke.modifiers.control || keystroke.modifiers.platform) {
             return false;
         }
+        let step = match keystroke.key.as_str() {
+            "=" | "+" => Some(1),
+            "-" => Some(-1),
+            "0" => None,
+            _ => return false,
+        };
+        self.step_interface_zoom(step, window);
+        true
+    }
+
+    /// One interface zoom step up or down, or back to 100% for `None`.
+    pub fn step_interface_zoom(
+        &mut self,
+        step: Option<i32>,
+        window: &mut Window,
+    ) {
         let steps = crate::ui::ZOOM_STEPS;
         let current = window.rem_size().as_f32() / crate::ui::BASE_REM;
         let index = steps
             .iter()
-            .position(|step| (step - current).abs() < 0.01)
-            .unwrap_or(2);
-        let next = match keystroke.key.as_str() {
-            "=" | "+" => (index + 1).min(steps.len() - 1),
-            "-" => index.saturating_sub(1),
-            "0" => 2,
-            _ => return false,
-        };
+            .position(|zoom| (zoom - current).abs() < 0.01)
+            .unwrap_or(DEFAULT_ZOOM);
+        let next = step.map_or(DEFAULT_ZOOM, |step| {
+            (index.cast_signed() + step as isize)
+                .clamp(0, steps.len().cast_signed() - 1) as usize
+        });
         window.set_rem_size(px(crate::ui::BASE_REM * steps[next]));
+        self.settings.zoom = Some(steps[next]);
+        self.save_settings();
         self.cache = None;
-        true
     }
 
+    /// Draw the folder as `chart`, and keep it for the next launch.
+    pub fn set_chart(&mut self, chart: Chart, cx: &mut Context<'_, Self>) {
+        if chart == self.chart {
+            return;
+        }
+        self.chart = chart;
+        // A page skips what the chart it was opened in drew.
+        self.rest_pages.clear();
+        self.forget_hover();
+        self.view = View::IDENTITY;
+        self.level_change = None;
+        self.cache = None;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Apply `choice`, and keep it for the next launch.
+    pub fn set_theme(
+        &mut self,
+        choice: ThemeChoice,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.theme = choice;
+        let native = crate::appearance::follows_system(self.home.as_deref());
+        crate::themes::apply(choice, native, cx);
+        self.save_settings();
+        cx.notify();
+    }
+
+    pub fn save_settings(&mut self) {
+        self.settings.theme = Some(self.theme);
+        self.settings.chart = Some(self.chart);
+        if let Some(path) = &self.settings_path {
+            self.settings.save(path);
+        }
+    }
+
+    /// The window's frame, kept for the next launch where the platform lets
+    /// an app place its own window.
+    pub fn remember_frame(&mut self, window: &Window) {
+        if !cfg!(any(target_os = "macos", windows)) {
+            return;
+        }
+        if let gpui_kit::WindowBounds::Windowed(bounds) = window.window_bounds()
+        {
+            self.settings.frame = Some(crate::settings::Frame {
+                x: bounds.origin.x.as_f32(),
+                y: bounds.origin.y.as_f32(),
+                width: bounds.size.width.as_f32(),
+                height: bounds.size.height.as_f32(),
+            });
+        }
+    }
+
+    /// Start removing what the plan acts on. The plan is judged again first:
+    /// a volume can be mounted, or a link swapped in, while the review is
+    /// open. Nothing starts while a removal is running.
     pub fn begin_removal(&mut self, cx: &mut Context<'_, Self>) {
-        let plan = self.plan();
+        if self.run.is_some() {
+            return;
+        }
+        self.replan();
+        let plan = self.plan.clone();
         if plan.is_empty() {
             self.notice = Some(("nothing is marked".into(), Status::Warning));
             cx.notify();
@@ -1932,6 +2911,9 @@ impl Disktree {
         let epoch = self.run_epoch;
         self.run_summary = RunSummary {
             total: plan.targets.len(),
+            planned: plan.bytes(),
+            total_entries: plan.entries(),
+            started: Some(Instant::now()),
             ..RunSummary::default()
         };
         self.run_log.clear();
@@ -1972,6 +2954,7 @@ impl Disktree {
         let Some(run) = &self.run else {
             return false;
         };
+        self.run_summary.progress = run.progress();
         let mut finished = false;
         while let Some(event) = run.poll() {
             match event {
@@ -2004,6 +2987,7 @@ impl Disktree {
         if finished {
             self.run = None;
             self.marks.clear();
+            self.replan();
             self.screen = Screen::Done;
             // The tree on screen is now wrong; start over rather than leaving
             // numbers that include what was just removed.
@@ -2080,8 +3064,9 @@ impl Disktree {
         }
         self.filter_applied = true;
         self.filter_epoch += 1;
+        self.rest_pages.clear();
         self.view = View::IDENTITY;
-        self.transition = None;
+        self.level_change = None;
         self.forget_hover();
         self.pointer_active = false;
         let tree = self.tree.clone();
@@ -2108,7 +3093,10 @@ impl Disktree {
         self.find.clear();
         self.find_open = false;
         self.matches = None;
-        self.filter_applied = false;
+        // A page of an applied filter's layout belongs to that layout.
+        if std::mem::take(&mut self.filter_applied) {
+            self.rest_pages.clear();
+        }
         self.filter_epoch += 1;
     }
 
@@ -2158,6 +3146,19 @@ impl Disktree {
             });
         })
         .detach();
+    }
+
+    /// Scan a folder handed over from outside: dropped on the window, or
+    /// opened with disktree from the Finder. Canonical, like a root from the
+    /// command line, so a later widening recognises it.
+    pub fn open_path(&mut self, path: PathBuf, cx: &mut Context<'_, Self>) {
+        if !self.can_start_over() {
+            return;
+        }
+        let path = dunce::canonicalize(&path).unwrap_or(path);
+        if path.is_dir() {
+            self.set_root(path, cx);
+        }
     }
 
     /// Save what the plan would act on as a list of paths, one per line,
@@ -2230,24 +3231,48 @@ impl Disktree {
 
     /// Show the tile a key acts on in Finder (or the file manager), selected.
     pub fn reveal_target(&mut self, cx: &mut Context<'_, Self>) {
-        let crumbs =
-            self.action_target().unwrap_or_else(|| self.crumbs.clone());
-        let Some(path) = self.path_at(&crumbs) else {
-            return;
-        };
+        let crumbs = self
+            .action_target()
+            .filter(|crumbs| !is_rest(crumbs))
+            .unwrap_or_else(|| self.crumbs.clone());
+        if let Some(path) = self.path_at(&crumbs) {
+            self.reveal_path(&path, cx);
+        }
+    }
+
+    /// Show `path` in Finder (or the file manager), selected.
+    pub fn reveal_path(&mut self, path: &Path, cx: &mut Context<'_, Self>) {
         // GPUI's reveal cannot report failure, so check what it can't.
-        if std::fs::symlink_metadata(&path).is_err() {
+        if std::fs::symlink_metadata(path).is_err() {
             self.notice = Some((
                 format!(
                     "{} is no longer on disk",
-                    crate::marks::display_path(&path, self.home.as_deref())
+                    display_path(path, self.home.as_deref())
                 ),
                 Status::Warning,
             ));
             cx.notify();
             return;
         }
-        cx.reveal_path(&path);
+        cx.reveal_path(path);
+    }
+
+    /// The review screen, with the plan judged again: a volume mounted since
+    /// the last mark must show as kept back.
+    pub fn open_review(&mut self, cx: &mut Context<'_, Self>) {
+        if self.screen == Screen::Running {
+            return;
+        }
+        if self.marks.is_empty() {
+            self.notice = Some((
+                "mark something first: space marks the selected tile".into(),
+                Status::Warning,
+            ));
+        } else {
+            self.replan();
+            self.screen = Screen::Review;
+        }
+        cx.notify();
     }
 
     /// Every binding, in reading order of the hint bar, so the keys and the
@@ -2277,6 +3302,16 @@ impl Disktree {
         }
 
         if self.crumb_menu.is_some() && self.on_menu_key(key, cx) {
+            return;
+        }
+
+        if self.context_menu.is_some() && self.on_context_key(key, cx) {
+            return;
+        }
+
+        if self.panel_detail.is_some() && key == "escape" {
+            self.panel_detail = None;
+            cx.notify();
             return;
         }
 
@@ -2387,7 +3422,9 @@ impl Disktree {
             "down" | "j" if !control => {
                 self.move_selection(Direction::Down, cx);
             }
-            "backspace" | "u" if !control => self.ascend(cx),
+            "backspace" | "u" if !control => {
+                self.ascend(cx);
+            }
             // A filter is the first thing Escape takes away.
             "escape" if self.matches.is_some() => self.clear_filter(),
             "escape" => {
@@ -2401,18 +3438,7 @@ impl Disktree {
             "space" => self.toggle_mark_selected(cx),
             "x" if !control => self.toggle_mark_selected(cx),
             "tab" => self.cycle_sibling(if shift { -1 } else { 1 }, cx),
-            "c" if !control => {
-                if self.marks.is_empty() {
-                    self.notice = Some((
-                        "mark something first: space marks the selected tile"
-                            .into(),
-                        Status::Warning,
-                    ));
-                } else {
-                    self.screen = Screen::Review;
-                }
-                cx.notify();
-            }
+            "c" if !control => self.open_review(cx),
             "[" => self.adjust_depth(-1, cx),
             "]" => self.adjust_depth(1, cx),
             "-" => {
@@ -2437,6 +3463,7 @@ impl Disktree {
             "t" if !control => {
                 self.set_mode((self.mode_index() + 1) % 3, cx);
             }
+            "v" if !control => self.set_chart(self.chart.next(), cx),
             "r" if !control => self.start_scan(cx),
             "g" if !control => self.go_to_disk(cx),
             "i" if !control => {
@@ -2547,21 +3574,45 @@ impl Disktree {
         event: &MouseDownEvent,
         cx: &mut Context<'_, Self>,
     ) {
+        self.context_menu = None;
         let origin = self.treemap_origin.get();
         let x = (event.position.x - origin.x).as_f32();
         let y = (event.position.y - origin.y).as_f32();
-        let crumbs = self.tile_at(x, y);
+        let modified = event.modifiers.control || event.modifiers.platform;
 
+        // A sunburst's hole and an icicle's first column are the directory
+        // drawn: clicking one goes up.
+        if self.chart.is_partition()
+            && event.button == MouseButton::Left
+            && self.chart_geometry().locate(x, y) == Location::Hole
+            && !(cfg!(target_os = "macos") && event.modifiers.control)
+        {
+            if event.click_count == 1 && !modified {
+                self.ascend(cx);
+            }
+            self.first_click_opened = false;
+            return;
+        }
+
+        let crumbs = self.tile_at(x, y);
         match event.button {
             MouseButton::Left if event.click_count >= 2 => {
+                // The first click of this double click already opened it.
+                if std::mem::take(&mut self.first_click_opened) {
+                    return;
+                }
                 if let Some(crumbs) = crumbs {
                     self.select(Some(crumbs), cx);
                     self.descend(cx);
                 }
             }
+            // On macOS a control-click is a right click.
             MouseButton::Left
-                if event.modifiers.control || event.modifiers.platform =>
+                if cfg!(target_os = "macos") && event.modifiers.control =>
             {
+                self.open_context_menu(event.position, crumbs, cx);
+            }
+            MouseButton::Left if modified => {
                 if let Some(crumbs) = crumbs {
                     self.toggle_mark(&crumbs, cx);
                 }
@@ -2569,15 +3620,20 @@ impl Disktree {
             MouseButton::Left => {
                 let activate = crumbs.as_ref().is_some_and(|crumbs| {
                     self.selected.as_ref() == Some(crumbs)
-                        && self.node_at(crumbs).is_some_and(Node::is_dir)
+                        && (is_rest(crumbs)
+                            || self.node_at(crumbs).is_some_and(Node::is_dir))
                 });
                 if activate {
                     // A second click on the selection opens it, like a file
                     // manager, without needing a double click.
                     self.descend(cx);
+                    self.first_click_opened = true;
                     return;
                 }
                 self.select(crumbs, cx);
+            }
+            MouseButton::Right => {
+                self.open_context_menu(event.position, crumbs, cx);
             }
             MouseButton::Middle => {
                 if let Some(crumbs) = crumbs {
@@ -2590,54 +3646,106 @@ impl Disktree {
             MouseButton::Navigate(NavigationDirection::Forward) => {
                 self.go_forward(cx);
             }
-            _ => {}
         }
+        self.first_click_opened = false;
     }
 
+    /// A mouse wheel moves in notches, and each one zooms; a trackpad sends a
+    /// stream of small deltas and then momentum. Momentum never zooms, and a
+    /// gesture stops once it has changed level. Sideways, or with shift, the
+    /// wheel pans a magnified treemap.
     pub fn on_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
         cx: &mut Context<'_, Self>,
     ) {
+        self.context_menu = None;
         let origin = self.treemap_origin.get();
         let x = (event.position.x - origin.x).as_f32();
         let y = (event.position.y - origin.y).as_f32();
-        let lines = match event.delta {
-            ScrollDelta::Lines(delta) => delta.y,
-            ScrollDelta::Pixels(delta) => delta.y.as_f32() / 24.0,
+        let (precise, dx, dy) = match event.delta {
+            ScrollDelta::Lines(delta) => (false, delta.x, delta.y),
+            ScrollDelta::Pixels(delta) => {
+                (true, delta.x.as_f32(), delta.y.as_f32())
+            }
         };
-        if lines.abs() < f32::EPSILON {
-            return;
+        let now = Instant::now();
+        let paused = self
+            .gesture
+            .last
+            .is_none_or(|last| now.duration_since(last) > GESTURE_PAUSE);
+        self.gesture.last = Some(now);
+        match event.touch_phase {
+            TouchPhase::Started => {
+                self.gesture.level_changed = false;
+                self.gesture.touching = true;
+                self.gesture.momentum = false;
+            }
+            // What follows without a new start is the gesture's momentum.
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                self.gesture.touching = false;
+                self.gesture.momentum = true;
+            }
+            TouchPhase::Moved if paused => {
+                self.gesture.level_changed = false;
+                self.gesture.momentum = false;
+            }
+            TouchPhase::Moved => {}
         }
-        if event.modifiers.shift {
-            // Pan instead of zoom, for looking around a magnified view.
-            self.view.origin_y =
-                (self.view.origin_y - lines * 40.0 / self.view.scale).max(0.0);
+
+        if event.modifiers.shift || dx.abs() > dy.abs() {
+            if self.chart.is_partition() {
+                return;
+            }
+            let (dx, dy) = if precise {
+                (dx, dy)
+            } else {
+                (dx * 40.0, dy * 40.0)
+            };
+            self.view.origin_x -= dx / self.view.scale;
+            self.view.origin_y -= dy / self.view.scale;
+            self.view = self.view.clamped(self.treemap_size.get());
             cx.notify();
             return;
         }
-        let factor = if lines > 0.0 { 1.15 } else { 1.0 / 1.15 };
-        self.zoom_at(x, y, factor, true, cx);
-    }
-
-    /// Advance the layout transition, if one is running.
-    pub fn tick_transition(&mut self, window: &Window) {
-        if let Some(transition) = self.transition {
-            let (_, running) = transition.sample(Rect::default());
-            if running {
-                window.request_animation_frame();
-            } else {
-                self.transition = None;
-            }
+        if dy.abs() < f32::EPSILON {
+            return;
+        }
+        if !precise {
+            let factor = if dy > 0.0 { 1.15 } else { 1.0 / 1.15 };
+            self.zoom_at(x, y, factor, true, cx);
+            return;
+        }
+        if self.gesture.momentum || self.gesture.level_changed {
+            return;
+        }
+        if self.zoom_at(x, y, 1.15_f32.powf(dy / 18.0), true, cx) {
+            self.gesture.level_changed = true;
         }
     }
 
-    /// A tile's rectangle for this frame: mid-transition it is on its way from
-    /// where it was to where it is.
-    fn animated_rect(&self, rect: Rect) -> Rect {
-        match self.transition {
-            Some(transition) => transition.sample(rect).0,
-            None => rect,
+    /// A trackpad pinch: the same zoom as the wheel, one level per pinch.
+    pub fn on_pinch(&mut self, event: &PinchEvent, cx: &mut Context<'_, Self>) {
+        if event.phase == TouchPhase::Started {
+            self.gesture.level_changed = false;
+        }
+        if self.gesture.level_changed {
+            return;
+        }
+        let origin = self.treemap_origin.get();
+        let x = (event.position.x - origin.x).as_f32();
+        let y = (event.position.y - origin.y).as_f32();
+        if self.zoom_at(x, y, 1.0 + event.delta, true, cx) {
+            self.gesture.level_changed = true;
+        }
+    }
+
+    /// Keep drawing while a level change plays.
+    pub fn tick_level_change(&mut self, window: &Window) {
+        if self.changing_level() {
+            window.request_animation_frame();
+        } else {
+            self.level_change = None;
         }
     }
 }
@@ -2727,6 +3835,33 @@ const HEADER_REMS: f32 = 1.375;
 /// Height of the slim label row a deeper open directory keeps, in rem.
 const HEADER_INNER_REMS: f32 = 1.0;
 
+/// An icicle row has no band of its own, so its name needs a whole line.
+const LABEL_LINE_REMS: f32 = 1.25;
+
+/// The icicle's first column, the directory itself, in rem; never more
+/// than a fifth of the chart.
+const FOLDER_COLUMN_REMS: f32 = 7.5;
+
+/// Where [`crate::ui::ZOOM_STEPS`] is at 100%.
+const DEFAULT_ZOOM: usize = 2;
+
+/// What revealing a path is called where it opens.
+const REVEAL: &str = if cfg!(target_os = "macos") {
+    "Reveal in Finder"
+} else if cfg!(windows) {
+    "Show in File Explorer"
+} else {
+    "Show in the file manager"
+};
+
+/// A path's last component, or the whole path for the root.
+fn short_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
 /// A trail step's label: the directory's own name, or `/` for the root.
 fn crumb_label(path: &Path) -> String {
     path.file_name().map_or_else(
@@ -2775,7 +3910,19 @@ impl Render for Disktree {
         cx: &mut Context<'_, Self>,
     ) -> impl gpui_kit::IntoElement {
         self.rem = window.rem_size().as_f32();
-        self.tick_transition(window);
+        self.tick_level_change(window);
+        let menus = crate::app_menu::MenuState {
+            mode: self.mode_index(),
+            chart: self.chart,
+            hidden: self.options.include_hidden,
+            apparent: self.options.apparent_size,
+            panel: self.show_selection,
+            theme: self.theme,
+        };
+        if self.menus != Some(menus) {
+            self.menus = Some(menus);
+            crate::app_menu::set_menus(menus, cx);
+        }
         // The titlebar names the directory on screen, however it got there:
         // a key, a click, a rescan or a folder chosen from the menu.
         let title = format!(
@@ -2847,53 +3994,6 @@ mod tests {
         .clamped(area);
         assert!(identity.origin_x.abs() < f32::EPSILON);
         assert!(identity.origin_y.abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn a_transition_starts_where_the_region_was_and_ends_where_it_is() {
-        // A region that occupied the whole viewport, landing in the top-left
-        // quarter of the new layout: everything inside it must start twice as
-        // large and centred where it was.
-        let transition = LayoutTransition::new(
-            Rect::new(0.0, 0.0, 800.0, 600.0),
-            Rect::new(0.0, 0.0, 400.0, 300.0),
-        );
-        // A tile inside the destination, at the far corner.
-        let tile = Rect::new(200.0, 150.0, 200.0, 150.0);
-        let (_, running) = transition.sample(tile);
-        assert!(running, "the transition is in flight");
-        let origin = transition.origin_of(tile);
-        assert!((origin.x - 400.0).abs() < 0.001, "{origin:?}");
-        assert!((origin.y - 300.0).abs() < 0.001, "{origin:?}");
-        assert!((origin.w - 400.0).abs() < 0.001, "{origin:?}");
-        assert!((origin.h - 300.0).abs() < 0.001, "{origin:?}");
-
-        let finished = LayoutTransition {
-            started: Instant::now()
-                .checked_sub(Duration::from_millis(500))
-                .expect("a moment on a running machine"),
-            ..transition
-        };
-        let (end, running) = finished.sample(tile);
-        assert!(!running);
-        assert_eq!(end, tile, "it ends exactly at the real layout");
-    }
-
-    #[test]
-    fn a_transition_grows_a_tile_that_is_being_entered() {
-        // Entering a child: the child's region becomes the viewport, so
-        // everything inside it gets bigger, never smaller.
-        let transition = LayoutTransition::new(
-            Rect::new(100.0, 100.0, 200.0, 200.0),
-            Rect::new(0.0, 0.0, 800.0, 600.0),
-        );
-        let tile = Rect::new(400.0, 300.0, 100.0, 100.0);
-        let origin = transition.origin_of(tile);
-        assert!(origin.w < tile.w, "it starts smaller: {origin:?}");
-        assert!(
-            origin.x > 100.0 && origin.x < 300.0,
-            "and where the child was: {origin:?}"
-        );
     }
 
     #[test]

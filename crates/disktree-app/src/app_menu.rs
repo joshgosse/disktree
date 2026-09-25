@@ -7,6 +7,9 @@
 
 use gpui_kit::{App, KeyBinding, Menu, MenuItem, SystemMenuType};
 
+use crate::charts::Chart;
+use crate::themes::ThemeChoice;
+
 pub use menu_actions::*;
 
 #[allow(
@@ -39,9 +42,67 @@ mod menu_actions {
             GoBack,
             /// Forward again, after going back.
             GoForward,
+            /// Areas by size, coloured by kind.
+            ShowSize,
+            /// Areas by file count, coloured by kind.
+            ShowFiles,
+            /// Areas by size, coloured by age.
+            ShowAge,
+            ShowTreemap,
+            ShowSunburst,
+            ShowIcicle,
+            /// Scan again with hidden entries, or without.
+            ToggleHidden,
+            /// Scan again measuring apparent size, or disk usage.
+            ToggleApparent,
+            FilterByName,
+            FewerLevels,
+            MoreLevels,
+            /// Interface zoom one step up.
+            ZoomIn,
+            /// Interface zoom one step down.
+            ZoomOut,
+            /// Interface zoom back to 100%.
+            ActualSize,
+            TogglePanel,
+            /// Up one folder.
+            EnclosingFolder,
+            OpenSelection,
+            HomeFolder,
+            WholeDisk,
+            /// Mark or unmark the tile a key acts on.
+            ToggleMark,
+            ReviewMarks,
+            UnmarkAll,
+            /// The keyboard and mouse overlay.
+            KeyboardShortcuts,
+            OpenRepository,
+            ThemeSystem,
+            ThemeHighContrast,
+            ThemeLight,
+            ThemePaper,
+            ThemeGlacier,
+            ThemeDark,
+            ThemeMidnight,
+            ThemeForest,
+            ThemeEmber,
         ]
     );
 }
+
+/// What the menus show a check beside, so they are rebuilt only when one
+/// of these changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MenuState {
+    pub mode: usize,
+    pub chart: Chart,
+    pub hidden: bool,
+    pub apparent: bool,
+    pub panel: bool,
+    pub theme: ThemeChoice,
+}
+
+pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
 /// Install the menus, the shortcuts and the quit-on-close rule.
 pub fn install(cx: &mut App) {
@@ -89,7 +150,78 @@ pub fn install(cx: &mut App) {
         // Finder's and Safari's back and forward; alt-arrows work too.
         KeyBinding::new("cmd-[", GoBack, None),
         KeyBinding::new("cmd-]", GoForward, None),
+        KeyBinding::new("cmd-1", ShowSize, None),
+        KeyBinding::new("cmd-2", ShowFiles, None),
+        KeyBinding::new("cmd-3", ShowAge, None),
+        // Finder's own shortcut for hidden files.
+        KeyBinding::new("cmd-shift-.", ToggleHidden, None),
+        KeyBinding::new("cmd-f", FilterByName, None),
+        KeyBinding::new("cmd-=", ZoomIn, None),
+        KeyBinding::new("cmd-+", ZoomIn, None),
+        KeyBinding::new("cmd--", ZoomOut, None),
+        KeyBinding::new("cmd-0", ActualSize, None),
+        KeyBinding::new("alt-cmd-i", TogglePanel, None),
+        KeyBinding::new("cmd-up", EnclosingFolder, None),
+        KeyBinding::new("cmd-down", OpenSelection, None),
+        KeyBinding::new("cmd-shift-h", HomeFolder, None),
+        KeyBinding::new("cmd-shift-d", WholeDisk, None),
+        KeyBinding::new("cmd-backspace", ToggleMark, None),
+        KeyBinding::new("cmd-e", ReviewMarks, None),
+        KeyBinding::new("cmd-/", KeyboardShortcuts, None),
     ]);
+    cx.on_action(|_: &OpenRepository, cx| cx.open_url(REPOSITORY));
+    set_menus(
+        MenuState {
+            mode: 0,
+            chart: Chart::default(),
+            hidden: false,
+            apparent: false,
+            panel: true,
+            theme: ThemeChoice::default(),
+        },
+        cx,
+    );
+}
+
+/// The menu bar, with checks beside what `state` says is on. macOS only:
+/// elsewhere GPUI draws no menu bar.
+pub fn set_menus(state: MenuState, cx: &App) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let check = |item: MenuItem, on: bool| item.checked(on);
+    let theme = |choice: ThemeChoice| {
+        let item = match choice {
+            ThemeChoice::System => {
+                MenuItem::action(choice.label(), ThemeSystem)
+            }
+            ThemeChoice::HighContrast => {
+                MenuItem::action(choice.label(), ThemeHighContrast)
+            }
+            ThemeChoice::Light => MenuItem::action(choice.label(), ThemeLight),
+            ThemeChoice::Paper => MenuItem::action(choice.label(), ThemePaper),
+            ThemeChoice::Glacier => {
+                MenuItem::action(choice.label(), ThemeGlacier)
+            }
+            ThemeChoice::Dark => MenuItem::action(choice.label(), ThemeDark),
+            ThemeChoice::Midnight => {
+                MenuItem::action(choice.label(), ThemeMidnight)
+            }
+            ThemeChoice::Forest => {
+                MenuItem::action(choice.label(), ThemeForest)
+            }
+            ThemeChoice::Ember => MenuItem::action(choice.label(), ThemeEmber),
+        };
+        check(item, state.theme == choice)
+    };
+    let mut themes = Vec::new();
+    for (index, choice) in ThemeChoice::ALL.into_iter().enumerate() {
+        // Following the system, then the light themes, then the dark.
+        if index == 1 || choice == ThemeChoice::Dark {
+            themes.push(MenuItem::separator());
+        }
+        themes.push(theme(choice));
+    }
     cx.set_menus([
         Menu::new("disktree").items([
             MenuItem::os_submenu("Services", SystemMenuType::Services),
@@ -108,9 +240,73 @@ pub fn install(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Close Window", CloseWindow),
         ]),
+        Menu::new("View").items([
+            check(MenuItem::action("Size", ShowSize), state.mode == 0),
+            check(MenuItem::action("Files", ShowFiles), state.mode == 1),
+            check(MenuItem::action("Age", ShowAge), state.mode == 2),
+            MenuItem::separator(),
+            MenuItem::submenu(Menu::new("Chart").items([
+                check(
+                    MenuItem::action("Treemap", ShowTreemap),
+                    state.chart == Chart::Treemap,
+                ),
+                check(
+                    MenuItem::action("Sunburst", ShowSunburst),
+                    state.chart == Chart::Sunburst,
+                ),
+                check(
+                    MenuItem::action("Icicle", ShowIcicle),
+                    state.chart == Chart::Icicle,
+                ),
+            ])),
+            MenuItem::separator(),
+            check(
+                MenuItem::action("Show Hidden Files", ToggleHidden),
+                state.hidden,
+            ),
+            check(
+                MenuItem::action("Apparent Size", ToggleApparent),
+                state.apparent,
+            ),
+            MenuItem::separator(),
+            MenuItem::action("Filter by Name\u{2026}", FilterByName),
+            MenuItem::action("Fewer Levels", FewerLevels),
+            MenuItem::action("More Levels", MoreLevels),
+            MenuItem::separator(),
+            MenuItem::action("Zoom In", ZoomIn),
+            MenuItem::action("Zoom Out", ZoomOut),
+            MenuItem::action("Actual Size", ActualSize),
+            MenuItem::separator(),
+            MenuItem::action(
+                if state.panel {
+                    "Hide Side Panel"
+                } else {
+                    "Show Side Panel"
+                },
+                TogglePanel,
+            ),
+            MenuItem::separator(),
+            MenuItem::submenu(Menu::new("Theme").items(themes)),
+        ]),
         Menu::new("Go").items([
             MenuItem::action("Back", GoBack),
             MenuItem::action("Forward", GoForward),
+            MenuItem::separator(),
+            MenuItem::action("Enclosing Folder", EnclosingFolder),
+            MenuItem::action("Open Selection", OpenSelection),
+            MenuItem::separator(),
+            MenuItem::action("Home Folder", HomeFolder),
+            MenuItem::action("Whole Disk", WholeDisk),
+        ]),
+        Menu::new("Marks").items([
+            MenuItem::action("Mark or Unmark Selection", ToggleMark),
+            MenuItem::action("Review Marked Items\u{2026}", ReviewMarks),
+            MenuItem::separator(),
+            MenuItem::action("Unmark All", UnmarkAll),
+        ]),
+        Menu::new("Help").items([
+            MenuItem::action("Keyboard Shortcuts", KeyboardShortcuts),
+            MenuItem::action("disktree on GitHub", OpenRepository),
         ]),
     ]);
 }

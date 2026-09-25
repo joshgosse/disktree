@@ -1,14 +1,14 @@
-//! Light or dark when there is no Omarchy theme to follow.
+//! What the system says about how the app should look and move.
 //!
 //! On Omarchy, gpui-omarchy follows the desktop's theme files. Elsewhere there
 //! are none, and gpui-omarchy would then stay on its dark default whatever
 //! the system is set to; there the app follows the system appearance instead,
 //! with the crate's own dark and light palettes, and switches when it does.
+//! See [`crate::themes`] for the themes that do the same.
 
 use std::path::Path;
 
-use gpui_kit::{App, Window, WindowAppearance};
-use gpui_omarchy::Theme;
+use gpui_kit::Window;
 
 /// Whether the system appearance, rather than an Omarchy theme, decides the
 /// colours: unless an Omarchy theme is installed, on macOS and Windows, and
@@ -35,25 +35,46 @@ fn states_a_preference(desktop: &str) -> bool {
         })
 }
 
-/// Apply the palette for `appearance`. Applying an explicit theme also stops
-/// gpui-omarchy watching for theme files that are not there.
-pub fn apply(appearance: WindowAppearance, cx: &mut App) {
-    let theme = match appearance {
-        WindowAppearance::Light | WindowAppearance::VibrantLight => {
-            Theme::flexoki_light()
-        }
-        WindowAppearance::Dark | WindowAppearance::VibrantDark => {
-            Theme::tokyo_night()
-        }
-    };
-    theme.apply(cx);
-}
-
-/// Follow `window`'s appearance from now on.
+/// Follow `window`'s appearance from now on, for the themes that do.
 pub fn follow(window: &Window) {
     window
-        .observe_window_appearance(|window, cx| apply(window.appearance(), cx))
+        .observe_window_appearance(|window, cx| {
+            crate::themes::follow_appearance(window.appearance(), cx);
+        })
         .detach();
+}
+
+/// Whether the system asks apps to keep motion to a minimum: Reduce Motion
+/// on macOS, animations turned off on GNOME. A level change then lands at
+/// once instead of flying there.
+pub fn reduces_motion() -> bool {
+    let read = |program: &str, arguments: &[&str]| {
+        std::process::Command::new(program)
+            .args(arguments)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            })
+    };
+    if cfg!(target_os = "macos") {
+        read(
+            "/usr/bin/defaults",
+            &["read", "com.apple.universalaccess", "reduceMotion"],
+        )
+        .is_some_and(|value| value == "1")
+    } else if cfg!(windows) {
+        false
+    } else {
+        read(
+            "gsettings",
+            &["get", "org.gnome.desktop.interface", "enable-animations"],
+        )
+        .is_some_and(|value| value == "false")
+    }
 }
 
 #[cfg(test)]

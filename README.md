@@ -68,10 +68,19 @@ and the Trash, and disktree counts them as unreadable. Started from a
 terminal, it is the terminal that needs the access. macOS also asks once
 each for Desktop, Documents and Downloads.
 
+It behaves like a Mac app: a menu bar with every command and its ⌘
+shortcut, checkmarks for what is on, a titlebar that is the top bar (drag its
+empty stretch to move the window), and the theme, chart, interface zoom and
+window frame kept for the next launch. Choose **Open With › disktree** on a
+folder in the Finder, or drop one on the Dock icon or the window, to scan
+it. A trackpad pinch zooms like the wheel, and level changes animate unless
+Reduce Motion is on.
+
 What is different from Linux:
 
 - **Free space** is what `df` reports. Finder's figure is larger: it counts
   purgeable space (caches and local snapshots macOS will clear on its own).
+  When that is more than a little, the ⓘ beside the figure says how much.
 - **Cloned files** (copies APFS shares blocks between, as Finder's Duplicate
   makes) are each counted in full, so a total can exceed what deleting them
   frees.
@@ -115,8 +124,9 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
 
 ### The screen
 
-- **Top:** the trail from `/`, then what is measured — **Size**, **Files** or
-  **Age**, **Hidden files**, **Apparent size**, and the depth drawn. In the
+- **Top:** the trail from `/`, then the chart — **Treemap**, **Sunburst** or
+  **Icicle** — what is measured — **Size**, **Files** or **Age**, **Hidden
+  files**, **Apparent size** — the depth drawn, and the theme. In the
   tree a crumb goes there, and its ▾ lists its siblings, largest first with
   their share and size, to jump sideways (arrows and Enter work too). Above
   the scanned root a crumb is dimmer, and clicking it widens the scan to
@@ -128,13 +138,35 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
   (caches, sync history, package stores, build output), independent of
   colour. Top-level directories carry a strip of their colour and a name
   band; deeper open directories a slim label row. In **Age** mode colour is
-  the last write instead, from this week to older.
+  the last write instead, from this week to older. When a directory holds
+  more than a level draws, its smallest items share one **+N more** tile:
+  open it (Enter, the wheel, or its menu) and they get the whole view, as a
+  page of their own with a crumb in the trail. It cannot be marked whole;
+  what is in it is marked one by one.
+- **Charts:** the same folder three ways, switched with `v`. A **treemap**
+  nests rectangles by size. A **sunburst** draws a ring per level around the
+  folder, whose name and size sit in the hole; clicking the hole goes up. An
+  **icicle** draws a column per level after one for the folder itself.
 - **Panel:** the selection (its size set large, share of the scan, files,
   last write, and for a checkout what git says — changes, stashes, unpushed
   commits); *Worth a look*, the largest things that could plausibly go;
   what is marked; and the disk, free now and after the marks, with the way
-  to the review screen. Drag its left edge to resize it; double-click the
+  to the review screen. When anything could not be read, the disk says how
+  many, and clicking that lists them and what to do about it. The panel
+  scrolls when it runs out of room, with the disk pinned below it while the
+  window is tall enough. Drag its left edge to resize it; double-click the
   edge to reset.
+- **Right-click** a tile (or control-click on macOS) for a menu of what can
+  be done with it: open it, mark or unmark it, show it in the file manager,
+  copy its path.
+
+A theme can be chosen from the palette button (on macOS also View › Theme):
+eight of disktree's own, light and dark, or **Match System**, the default,
+which follows Omarchy's theme where there is one and the system's appearance
+elsewhere. The choice, the chart and the interface zoom are kept in
+`disktree/settings` under the platform's settings directory
+(`~/.config` on Linux, `~/Library/Application Support` on macOS, `%APPDATA%`
+on Windows).
 
 One colour is kept apart: amber marks the selection, the main action, and
 what can be had back.
@@ -156,10 +188,13 @@ Marking is reversible — press it again — and the saving is never counted twi
 
 ### Zooming and going in
 
-Scroll to magnify toward the pointer. The wheel magnifies until the directory
-under the pointer fills the view, and the next notch goes into it — one
-continuous motion, with the directory's contents growing into place. Scroll the
-other way to come back out. Enter goes into the selected directory at any
+Scroll to magnify toward the pointer. The wheel magnifies until the
+directory under the pointer, one level down, fills the view, and the next
+notch goes into it — one continuous motion, with the directory's contents
+growing into place. It goes a level at a time: a trackpad swipe or its
+momentum never goes more than one level. Scroll the other way to come back
+out. In a sunburst or an icicle the wheel goes straight in or out. Enter
+goes into the selected directory at any
 depth, and Backspace or Escape goes up one level. `<` and `>`, beside the
 Size / Files / Age switch, go back and forward through the directories visited,
 as do `alt ←` `alt →` (also `⌘[` `⌘]` on macOS) and the mouse's side
@@ -178,8 +213,11 @@ there, then choose:
 - **Delete permanently** — `rm -rf` semantics. It always asks first, in a dialog
   that names what goes and how much comes back.
 
-When it finishes, disktree scans again so the numbers on screen match the disk,
-and shows how much free space was actually gained.
+While it runs, it names what it is removing and counts the files and
+folders gone. When it finishes, disktree scans again so the numbers on
+screen match the disk, and shows how much free space was actually gained,
+with what can hold some back: the trash, Time Machine's local snapshots on
+macOS, other programs writing meanwhile.
 
 ## Keys
 
@@ -187,33 +225,38 @@ and shows how much free space was actually gained.
 | --- | --- |
 | `space` / `x` | mark or unmark the tile you point at |
 | `ctrl`-click (`⌘`-click on macOS) | mark without moving the selection |
-| `enter` | open that directory, at any depth |
+| `enter` | open that directory, at any depth, or what **+N more** stands for |
 | `⌫` / `esc` | go up one directory |
 | `alt ←` `alt →` | back and forward through where you have been |
 | `←` `↑` `↓` `→` | move between tiles at this level |
 | `tab` | next largest sibling |
-| scroll | zoom toward a directory, then go into it |
+| scroll (or pinch on macOS) | zoom toward a directory, then go into it, a level at a time |
 | `shift`-scroll | pan the magnified view |
 | `[` `]` | draw fewer or more levels at once |
 | `-` `=` `0` | magnify, shrink, reset the view |
 | `ctrl =` `ctrl -` `ctrl 0` (`⌘` on macOS) | interface zoom |
 | `/` | filter by name: only matches keep their colour; `enter` shows only them, `esc` clears |
 | `c` | review the marked list |
-| `t` | rank by size or by file count |
+| `t` | size, files or age: what areas and colours say |
+| `v` | treemap, sunburst or icicle |
 | `d` | disk usage or apparent size |
 | `i` | include or skip hidden entries |
 | `r` | scan again |
 | `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
 | `g` | the whole disk |
-| `p` | show or hide the selection line |
+| `p` | show or hide the side panel |
 | `o` | show it in Finder, File Explorer or the file manager |
+| right-click | open, mark, reveal or copy the path of that tile |
 | `?` | every key |
 | `q` | quit |
 
 On macOS the menu bar also has ⌘⇧R to show the selection in Finder, ⌘R to
-rescan, ⌘[ and ⌘] for back and forward, and ⌘Q, ⌘H and ⌘W (closing the
-window quits); other ⌘ chords are left to the system. On Linux and Windows
-the same work with ctrl, with F5 to rescan too.
+rescan, ⌘[ and ⌘] for back and forward, ⌘1 ⌘2 ⌘3 for Size, Files and Age,
+⌘⇧. for hidden files, ⌘F to filter, ⌘= ⌘- ⌘0 for interface zoom, ⌥⌘I for
+the side panel, ⌘↑ and ⌘↓ to go up and in, ⌘⇧H and ⌘⇧D for the home folder
+and the whole disk, ⌘⌫ to mark, ⌘E to review, ⌘/ for the keys, and ⌘Q, ⌘H
+and ⌘W (closing the window quits). On Linux and Windows the menu bar's
+basics work with ctrl, with F5 to rescan too.
 
 On the review screen: `m` trash, `p` permanent, `!` unmark all, `enter`
 commits, `esc` goes back. Or hand the list on instead of acting on it: `s`
