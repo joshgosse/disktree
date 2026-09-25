@@ -1493,6 +1493,7 @@ impl Disktree {
             path,
             bytes: node.value(self.options.metric),
             is_dir: node.is_dir(),
+            entries: node.files + node.dirs,
         })
     }
 

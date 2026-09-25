@@ -70,6 +70,7 @@ impl Marks {
                     is_dir: node.is_dir(),
                     hidden: is_hidden(&item.path),
                     path: item.path.clone(),
+                    entries: node.files + node.dirs,
                 }),
                 None => resolved.push(Target {
                     bytes: 0,
@@ -146,6 +147,7 @@ mod tests {
             bytes,
             is_dir: false,
             hidden: false,
+            entries: 1,
         }
     }
 
@@ -180,6 +182,7 @@ mod tests {
         assert_eq!(marks.items()[0].bytes, 900);
         assert!(marks.items()[0].is_dir);
         assert!(marks.items()[0].hidden, "the .cache mark is hidden");
+        assert_eq!(marks.items()[0].entries, 2, ".cache and blob.bin");
         assert_eq!(marks.items()[1].bytes, 0, "a path that no longer exists");
     }
 

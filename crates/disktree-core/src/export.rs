@@ -159,6 +159,7 @@ mod tests {
             bytes,
             is_dir,
             hidden: false,
+            entries: 1,
         }
     }
 

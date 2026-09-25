@@ -20,7 +20,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
@@ -32,6 +32,10 @@ pub struct Target {
     pub bytes: u64,
     pub is_dir: bool,
     pub hidden: bool,
+    /// Files and directories the scan counted at or beneath it, the target
+    /// itself included; a file is 1. What a permanent removal's progress is
+    /// measured against.
+    pub entries: u64,
 }
 
 /// How a removal should be carried out.
@@ -83,6 +87,10 @@ pub struct Plan {
 impl Plan {
     pub fn bytes(&self) -> u64 {
         self.targets.iter().map(|target| target.bytes).sum()
+    }
+
+    pub fn entries(&self) -> u64 {
+        self.targets.iter().map(|target| target.entries).sum()
     }
 
     pub const fn is_empty(&self) -> bool {
@@ -415,6 +423,11 @@ fn refuse(
             "it contains {system}, which is part of the system"
         ));
     }
+    if let Some(reason) =
+        macos_folder(&key, home_key, cfg!(target_os = "macos"))
+    {
+        return Some(reason.into());
+    }
     if is_mount_point(path) {
         return Some(
             "a mount point: removing it would cross onto another filesystem"
@@ -429,6 +442,38 @@ fn refuse(
         ));
     }
     None
+}
+
+const MACOS_EXPECTS: &str =
+    "a folder macOS expects to exist; remove what is inside it instead";
+
+/// Why the path keyed `key` is a folder a Mac keeps, if it is: another
+/// account's home, or `/Users/Shared`, `~/Library` or `~/.Trash`
+/// themselves, never what is inside them. `/Users` shares the startup
+/// volume, so no mount point sets another account's home apart. `key` and
+/// `home` are keyed by [`guard_key_for`] with `macos`.
+fn macos_folder(
+    key: &Path,
+    home: Option<&Path>,
+    macos: bool,
+) -> Option<&'static str> {
+    if !macos {
+        return None;
+    }
+    let keyed = |path: &Path| guard_key_for(path, true);
+    if key == keyed(Path::new("/Users/Shared")) {
+        return Some(MACOS_EXPECTS);
+    }
+    let users = keyed(Path::new("/Users"));
+    if key.parent() == Some(users.as_path()) && home != Some(key) {
+        return Some("another user's home folder");
+    }
+    let kept = home.is_some_and(|home| {
+        ["Library", ".Trash"]
+            .iter()
+            .any(|name| key == keyed(&home.join(name)))
+    });
+    kept.then_some(MACOS_EXPECTS)
 }
 
 /// A name Win32 reads as some other one. It strips trailing dots and
@@ -820,11 +865,78 @@ pub enum RemovalEvent {
     },
 }
 
+/// How far a run has got. One target can be a folder of a million files,
+/// so this moves within a target, not only between them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemovalProgress {
+    /// The target being removed.
+    pub current: Option<PathBuf>,
+    /// Entries of finished targets, and those removed so far from the
+    /// current one, never more than the scan counted for it.
+    pub entries: u64,
+}
+
+/// What the worker has got through, shared with its [`RemovalHandle`].
+#[derive(Debug, Default)]
+struct Progress {
+    targets: std::sync::Mutex<Targets>,
+    /// Entries removed from the current target. Off the lock: it moves once
+    /// per unlink.
+    in_current: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct Targets {
+    current: Option<Target>,
+    /// Entries of every target finished, removed or not.
+    finished: u64,
+}
+
+impl Progress {
+    fn targets(&self) -> std::sync::MutexGuard<'_, Targets> {
+        self.targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn begin(&self, target: &Target) {
+        // Before the target is published, so no snapshot pairs it with the
+        // count left from the one before.
+        self.in_current.store(0, Ordering::Relaxed);
+        self.targets().current = Some(target.clone());
+    }
+
+    fn advance(&self) {
+        self.in_current.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A failed target counts in full too, so a run ends at its plan's
+    /// [`Plan::entries`].
+    fn finish(&self) {
+        let mut targets = self.targets();
+        if let Some(target) = targets.current.take() {
+            targets.finished += target.entries;
+        }
+    }
+
+    fn snapshot(&self) -> RemovalProgress {
+        let targets = self.targets();
+        let in_current = targets.current.as_ref().map_or(0, |target| {
+            self.in_current.load(Ordering::Relaxed).min(target.entries)
+        });
+        RemovalProgress {
+            current: targets.current.as_ref().map(|target| target.path.clone()),
+            entries: targets.finished + in_current,
+        }
+    }
+}
+
 /// A removal running on its own thread.
 #[derive(Debug)]
 pub struct RemovalHandle {
     events: Receiver<RemovalEvent>,
     cancel: Arc<AtomicBool>,
+    progress: Arc<Progress>,
 }
 
 impl RemovalHandle {
@@ -839,6 +951,11 @@ impl RemovalHandle {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+
+    /// Where the run is now, as the worker last left it.
+    pub fn progress(&self) -> RemovalProgress {
+        self.progress.snapshot()
+    }
 }
 
 /// Start removing the plan's targets on a worker thread.
@@ -846,6 +963,8 @@ pub fn spawn(plan: Plan, mode: RemovalMode) -> RemovalHandle {
     let (sender, events) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
+    let progress = Arc::new(Progress::default());
+    let worker_progress = Arc::clone(&progress);
     let backend = if mode == RemovalMode::Trash {
         detect_trash_backend()
     } else {
@@ -856,7 +975,16 @@ pub fn spawn(plan: Plan, mode: RemovalMode) -> RemovalHandle {
         .name("disktree-remove".into())
         .spawn({
             let sender = sender.clone();
-            move || run(&plan, mode, backend, &worker_cancel, &sender)
+            move || {
+                run(
+                    &plan,
+                    mode,
+                    backend,
+                    &worker_cancel,
+                    &worker_progress,
+                    &sender,
+                );
+            }
         });
     if let Err(error) = worker {
         let _ = sender.send(RemovalEvent::Item {
@@ -868,7 +996,11 @@ pub fn spawn(plan: Plan, mode: RemovalMode) -> RemovalHandle {
         });
     }
 
-    RemovalHandle { events, cancel }
+    RemovalHandle {
+        events,
+        cancel,
+        progress,
+    }
 }
 
 fn run(
@@ -876,6 +1008,7 @@ fn run(
     mode: RemovalMode,
     backend: TrashBackend,
     cancel: &AtomicBool,
+    progress: &Progress,
     sender: &mpsc::Sender<RemovalEvent>,
 ) {
     let _ = sender.send(RemovalEvent::Start {
@@ -898,6 +1031,7 @@ fn run(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
+        progress.begin(target);
         let reason = mounted(&target.path, &mounts).or_else(|| {
             linked(
                 &target.path,
@@ -910,12 +1044,15 @@ fn run(
             Err(io::Error::other(reason))
         } else {
             match mode {
-                RemovalMode::Permanent => {
-                    remove_permanently(&target.path, &plan.root)
-                }
+                RemovalMode::Permanent => remove_permanently_counting(
+                    &target.path,
+                    &plan.root,
+                    &|| progress.advance(),
+                ),
                 RemovalMode::Trash => move_to_trash(&target.path, backend),
             }
         };
+        progress.finish();
         if outcome.is_ok() {
             removed += 1;
             bytes += target.bytes;
@@ -951,6 +1088,11 @@ fn mounted(path: &Path, mounts: &[PathBuf]) -> Option<String> {
     })
 }
 
+/// [`remove_permanently_counting`], counting nothing.
+pub fn remove_permanently(path: &Path, root: &Path) -> io::Result<()> {
+    remove_permanently_counting(path, root, &|| {})
+}
+
 /// `rm -rf --one-file-system` semantics: a symlink is unlinked, never
 /// followed, and nothing on another filesystem is touched.
 ///
@@ -962,21 +1104,30 @@ fn mounted(path: &Path, mounts: &[PathBuf]) -> Option<String> {
 ///
 /// The same goes for the way down to `path` from `root`, the scanned root:
 /// see [`open_parent`].
+///
+/// `removed` is called once for every file, link and directory unlinked,
+/// `path` itself last.
 #[cfg(unix)]
-pub fn remove_permanently(path: &Path, root: &Path) -> io::Result<()> {
+pub fn remove_permanently_counting(
+    path: &Path,
+    root: &Path,
+    removed: &dyn Fn(),
+) -> io::Result<()> {
     use rustix::fs::{AtFlags, FileType, statat, unlinkat};
 
     let (parent, name) = open_parent(path, root)?;
     let stat = statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
         unlinkat(&parent, name, AtFlags::empty())?;
+        removed();
         return Ok(());
     }
     let dir = open_dir(&parent, name)?;
     let top = Volume::of(&dir)?;
-    remove_contents(&dir, &top, path)?;
+    remove_contents(&dir, &top, path, removed)?;
     drop(dir);
     unlinkat(&parent, name, AtFlags::REMOVEDIR)?;
+    removed();
     Ok(())
 }
 
@@ -1070,8 +1221,14 @@ fn open_step<P: rustix::path::Arg>(
     )
 }
 
+/// `fs::remove_dir_all` says nothing on the way, so `removed` is never
+/// called: a run counts the target when it finishes.
 #[cfg(not(unix))]
-pub fn remove_permanently(path: &Path, _root: &Path) -> io::Result<()> {
+pub fn remove_permanently_counting(
+    path: &Path,
+    _root: &Path,
+    _removed: &dyn Fn(),
+) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.is_dir() {
         fs::remove_dir_all(path)
@@ -1145,12 +1302,14 @@ fn open_dir<P: rustix::path::Arg>(
     )
 }
 
-/// Empty the directory open at `dir`, staying on the volume of `top`.
+/// Empty the directory open at `dir`, staying on the volume of `top`, and
+/// call `removed` for every entry unlinked.
 #[cfg(unix)]
 fn remove_contents(
     dir: &std::os::fd::OwnedFd,
     top: &Volume,
     path: &Path,
+    removed: &dyn Fn(),
 ) -> io::Result<()> {
     use rustix::fs::{AtFlags, Dir, FileType, unlinkat};
     use rustix::io::Errno;
@@ -1171,6 +1330,7 @@ fn remove_contents(
     for (name, kind) in entries {
         if !matches!(kind, FileType::Directory | FileType::Unknown) {
             unlinkat(dir, &name, AtFlags::empty())?;
+            removed();
             continue;
         }
         let child = match open_dir(dir, &name) {
@@ -1179,6 +1339,7 @@ fn remove_contents(
             // filesystem that does not report types.
             Err(Errno::NOTDIR | Errno::LOOP) => {
                 unlinkat(dir, &name, AtFlags::empty())?;
+                removed();
                 continue;
             }
             Err(error) => return Err(error.into()),
@@ -1192,9 +1353,10 @@ fn remove_contents(
                 child_path.display()
             )));
         }
-        remove_contents(&child, top, &child_path)?;
+        remove_contents(&child, top, &child_path, removed)?;
         drop(child);
         unlinkat(dir, &name, AtFlags::REMOVEDIR)?;
+        removed();
     }
     Ok(())
 }
@@ -1406,6 +1568,7 @@ mod tests {
             bytes,
             is_dir: path.is_dir(),
             hidden: false,
+            entries: 1,
         }
     }
 
@@ -1714,6 +1877,87 @@ mod tests {
         assert!(reason.contains("/Library"), "{reason}");
     }
 
+    /// [`macos_folder`] for plain paths, keyed as on macOS, with the home
+    /// directory at `/Users/tobi`.
+    fn kept_by_a_mac(path: &str) -> Option<&'static str> {
+        let key = |path: &str| guard_key_for(Path::new(path), true);
+        macos_folder(&key(path), Some(&key("/Users/tobi")), true)
+    }
+
+    #[test]
+    fn another_users_home_folder_is_refused_on_macos() {
+        let other = Some("another user's home folder");
+        assert_eq!(kept_by_a_mac("/Users/someone"), other);
+        assert_eq!(
+            kept_by_a_mac("/users/SOMEONE"),
+            other,
+            "without regard to case"
+        );
+        assert_eq!(
+            kept_by_a_mac("/System/Volumes/Data/Users/someone"),
+            other,
+            "under the Data volume's name"
+        );
+        assert_eq!(
+            kept_by_a_mac("/Users/tobi"),
+            None,
+            "home is refused as home, not as someone else's"
+        );
+        let nobody = guard_key_for(Path::new("/Users/someone"), true);
+        assert_eq!(
+            macos_folder(&nobody, None, true),
+            other,
+            "without a home directory, every account is another's"
+        );
+    }
+
+    #[test]
+    fn the_folders_macos_expects_are_refused_but_not_what_is_inside() {
+        for path in [
+            "/Users/Shared",
+            "/Users/tobi/Library",
+            "/Users/tobi/library",
+            "/Users/tobi/.Trash",
+        ] {
+            assert_eq!(kept_by_a_mac(path), Some(MACOS_EXPECTS), "{path}");
+        }
+        for path in [
+            "/Users/Shared/old.dmg",
+            "/Users/tobi/Library/Caches/com.example",
+            "/Users/tobi/.Trash/old.dmg",
+            "/Users/tobi/src/Library",
+        ] {
+            assert_eq!(kept_by_a_mac(path), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn the_folders_a_mac_keeps_are_only_kept_on_a_mac() {
+        let key = |path: &str| guard_key_for(Path::new(path), false);
+        let home = key("/home/tobi");
+        for path in ["/Users/someone", "/Users/Shared", "/home/tobi/Library"] {
+            assert_eq!(macos_folder(&key(path), Some(&home), false), None);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_guards_keep_other_homes_and_the_folders_macos_expects() {
+        let home = Home::of(Path::new("/Users/tobi"));
+        let refused = |path: &str| {
+            refuse(Path::new(path), Path::new("/"), Some(&home), &[])
+        };
+        assert_eq!(
+            refused("/Users/someone").as_deref(),
+            Some("another user's home folder")
+        );
+        assert_eq!(
+            refused("/Users/tobi/.Trash").as_deref(),
+            Some(MACOS_EXPECTS)
+        );
+        assert_eq!(refused("/Users/tobi/.Trash/old.dmg"), None);
+    }
+
     #[test]
     fn permanent_removal_takes_nested_trees_and_hidden_files() {
         let temp = tree();
@@ -1724,6 +1968,30 @@ mod tests {
         remove_permanently(&doomed, temp.path()).expect("remove tree");
         assert!(!doomed.exists());
         assert!(temp.path().join("other").exists());
+    }
+
+    /// One folder can take minutes to delete, so progress moves inside it:
+    /// every file, link and directory gone is counted, the folder too.
+    #[test]
+    #[cfg(unix)]
+    fn permanent_removal_counts_each_entry_as_it_goes() {
+        let temp = tree();
+        std::os::unix::fs::symlink("one.bin", temp.path().join("a/link"))
+            .expect("symlink");
+        let removed = std::cell::Cell::new(0_u64);
+        let count = || removed.set(removed.get() + 1);
+        remove_permanently_counting(
+            &temp.path().join("a"),
+            temp.path(),
+            &count,
+        )
+        .expect("removed");
+        assert_eq!(removed.get(), 5, "a, a/b, a/one.bin, a/c.bin and a/link");
+        let single = temp.path().join("single.bin");
+        fs::write(&single, b"x").expect("write");
+        remove_permanently_counting(&single, temp.path(), &count)
+            .expect("removed");
+        assert_eq!(removed.get(), 6);
     }
 
     #[test]
@@ -2050,6 +2318,97 @@ mod tests {
         }
         assert!(!root.join("a/b").exists());
         assert!(root.join("a/one.bin").exists());
+    }
+
+    /// The bar moves through a target and ends full: a target that failed
+    /// counts in full too.
+    #[test]
+    fn a_removal_run_reports_progress_up_to_the_plan() {
+        let temp = tree();
+        let root = temp.path();
+        let many = root.join("many");
+        fs::create_dir_all(many.join("nested")).expect("mkdir");
+        for index in 0..500 {
+            let dir = if index % 2 == 0 {
+                many.clone()
+            } else {
+                many.join("nested")
+            };
+            fs::write(dir.join(format!("{index}.bin")), b"x").expect("write");
+        }
+        let plan = plan(
+            &[
+                Target {
+                    entries: 502,
+                    ..target(&many, 0)
+                },
+                target(&root.join("absent"), 0),
+            ],
+            root,
+        );
+        assert_eq!(plan.entries(), 503, "many, nested, 500 files and absent");
+
+        let handle = spawn(plan, RemovalMode::Permanent);
+        let (mut last, mut done) = (0, false);
+        for _ in 0..5000 {
+            let progress = handle.progress();
+            assert!(progress.entries >= last, "never backwards");
+            assert!(progress.entries <= 503, "never past the plan");
+            last = progress.entries;
+            while let Some(event) = handle.poll() {
+                done |= matches!(event, RemovalEvent::Done { .. });
+            }
+            if done {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(done, "the run finished");
+        assert_eq!(
+            handle.progress(),
+            RemovalProgress {
+                current: None,
+                entries: 503
+            }
+        );
+        assert!(!many.exists());
+    }
+
+    #[test]
+    fn progress_within_a_target_stops_at_what_the_scan_counted() {
+        let progress = Progress::default();
+        let first = Target {
+            entries: 3,
+            ..target(Path::new("/r/first"), 0)
+        };
+        let second = Target {
+            entries: 4,
+            ..target(Path::new("/r/second"), 0)
+        };
+        let at = |current: &Target, entries| RemovalProgress {
+            current: Some(current.path.clone()),
+            entries,
+        };
+
+        progress.begin(&first);
+        for _ in 0..10 {
+            progress.advance();
+        }
+        assert_eq!(progress.snapshot(), at(&first, 3), "more than scanned");
+        progress.finish();
+        progress.begin(&second);
+        assert_eq!(progress.snapshot(), at(&second, 3), "a fresh count");
+        progress.advance();
+        assert_eq!(progress.snapshot(), at(&second, 4));
+        progress.finish();
+        assert_eq!(
+            progress.snapshot(),
+            RemovalProgress {
+                current: None,
+                entries: 7
+            },
+            "fewer than scanned counts in full once finished"
+        );
     }
 
     #[cfg(unix)]
