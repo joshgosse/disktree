@@ -577,6 +577,7 @@ fn the_review_screen_switches_removal_mode(cx: &mut TestAppContext) {
             bytes: 300_000,
             is_dir: true,
             hidden: false,
+            entries: 1,
         });
         app.screen = Screen::Review;
         cx.notify();
@@ -610,6 +611,7 @@ fn the_review_screen_copies_the_list_as_an_agent_prompt(
             bytes: 300_000,
             is_dir: true,
             hidden: false,
+            entries: 1,
         });
         app.screen = Screen::Review;
         cx.notify();
@@ -648,6 +650,7 @@ fn escape_in_the_delete_dialog_cancels(cx: &mut TestAppContext) {
             bytes: 300_000,
             is_dir: true,
             hidden: false,
+            entries: 1,
         });
         app.screen = Screen::Review;
         cx.notify();
